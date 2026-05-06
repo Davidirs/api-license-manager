@@ -1,31 +1,33 @@
+require('dotenv').config();
 const admin = require('firebase-admin');
-
-// Si tienes el archivo JSON descargado desde Firebase, puedes cargarlo así:
-// const serviceAccount = require('./serviceAccountKey.json');
-
-// Opcionalmente, puedes configurar las credenciales a través de variables de entorno (recomendado para producción)
-// para esto tendrías que guardar el stringificado de tu JSON de credenciales en tu archivo .env
-// const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 let db;
 
 try {
-  // Inicializamos Firebase Admin.
-  // IMPORTANTE: Debes colocar tu archivo serviceAccountKey.json en esta carpeta (api-server)
-  // y descomentar la línea de abajo, o usar variables de entorno.
-  
-  // Opción 1: Archivo JSON local (asegúrate de agregarlo a .gitignore)
-  const serviceAccount = require('./serviceAccountKey.json');
-  
+  const serviceAccount = {
+    type: process.env.FIREBASE_TYPE,
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+    // Las comillas en el .env escapan los \n — los reemplazamos por saltos de línea reales
+    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    client_id: process.env.FIREBASE_CLIENT_ID,
+    auth_uri: process.env.FIREBASE_AUTH_URI,
+    token_uri: process.env.FIREBASE_TOKEN_URI,
+    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_CERT_URL,
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL,
+    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN,
+  };
+
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(serviceAccount),
   });
 
   db = admin.firestore();
   console.log('🔥 Conexión a Firebase Firestore exitosa.');
 } catch (error) {
   console.error('❌ Error al inicializar Firebase Admin:', error);
-  console.error('⚠️  Asegúrate de tener el archivo serviceAccountKey.json en la carpeta api-server');
+  console.error('⚠️  Asegúrate de tener las variables FIREBASE_* definidas en tu .env');
 }
 
 module.exports = { admin, db };
