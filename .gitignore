@@ -2,3 +2,4 @@ serviceAccountKey.json
 .env
 node_modules
 .DS_Store
+backup-database.csv

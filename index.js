@@ -1,4 +1,4 @@
-require("dotenv").config({ path: "../.env" });
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const platformClient = require("purecloud-platform-client-v2");
@@ -57,27 +57,75 @@ app.post("/api/login", async (req, res) => {
     }
 
     const userFound = userDoc.data();
+    console.log(
+      `👤 Usuario encontrado: username="${cleanUsername}" | role="${userFound.role}" | orgname="${userFound.orgname}" | thrusted="${userFound.thrusted}"`,
+    );
 
-    // Si no es admin, validar que pertenece a la organización solicitada
-    if (userFound.role !== "administrator" && userFound.orgname !== orgname) {
-      return res.status(401).json({
-        success: false,
-        message: "El usuario no pertenece a la organización especificada.",
-      });
+    // Si no es admin, validar permisos
+    if (userFound.role !== "administrator") {
+      let hasAccess = false;
+
+      // Si es supervisor, puede entrar a cualquier organización que pertenezca a su 'thrusted'
+      if (userFound.role === "supervisor") {
+        console.log(
+          `🔍 [Supervisor] Buscando org "${orgname}" con thrusted="${userFound.thrusted}" en colección organizations...`,
+        );
+        const orgSnapshot = await db
+          .collection("organizations")
+          .where("orgname", "==", orgname)
+          .where("thrusted", "==", userFound.thrusted)
+          .get();
+
+        if (!orgSnapshot.empty) {
+          hasAccess = true;
+          console.log(
+            `✅ [Supervisor] Org encontrada: "${orgname}" pertenece al thrusted "${userFound.thrusted}"`,
+          );
+        } else {
+          console.warn(
+            `⚠️ [Supervisor] No se encontró la org "${orgname}" con thrusted="${userFound.thrusted}". Docs encontrados: ${orgSnapshot.size}`,
+          );
+        }
+      }
+
+      // Si es cliente o el supervisor intenta entrar a su propia organización asignada
+      if (!hasAccess && userFound.orgname === orgname) {
+        hasAccess = true;
+        console.log(
+          `✅ [Acceso directo] orgname del usuario ("${userFound.orgname}") coincide con la solicitada ("${orgname}")`,
+        );
+      }
+
+      if (!hasAccess) {
+        console.error(
+          `❌ [Acceso denegado] username="${cleanUsername}" | role="${userFound.role}" | orgname_usuario="${userFound.orgname}" | orgname_solicitada="${orgname}" | thrusted="${userFound.thrusted}"`,
+        );
+        return res.status(401).json({
+          success: false,
+          message:
+            "El usuario no pertenece a la organización especificada o no tiene permisos.",
+        });
+      }
+    } else {
+      console.log(
+        `👑 [Admin] Acceso total concedido a username="${cleanUsername}"`,
+      );
     }
 
     // Verificar contraseña
+    console.log(`🔐 Verificando contraseña para "${cleanUsername}"...`);
     const passwordMatch = await bcrypt.compare(
       password,
       userFound.passwordHash,
     );
     if (!passwordMatch) {
+      console.error(`❌ [Contraseña incorrecta] username="${cleanUsername}"`);
       return res
         .status(401)
         .json({ success: false, message: "Contraseña incorrecta." });
     }
 
-    console.log("Login successful for:", { orgname, username });
+    console.log("✅ Login successful for:", { orgname, username });
 
     let tokens;
 
@@ -123,12 +171,41 @@ app.post("/api/login", async (req, res) => {
         orgCred.clientSecret,
         orgCred.region,
       );
+      console.log("Token obtenido:", tokens);
+    }
+
+    // Construir el objeto de usuario a devolver al front
+    let userResponse = { ...userFound };
+
+    // Si es supervisor, sobrescribir orgname, orgId, clientId, clientSecret y region
+    // con los datos de la organización a la que está iniciando sesión,
+    // ya que puede navegar en cualquier org hija de su thrusted
+    if (userFound.role === "supervisor") {
+      const targetOrgSnapshot = await db
+        .collection("organizations")
+        .where("orgname", "==", orgname)
+        .get();
+
+      if (!targetOrgSnapshot.empty) {
+        const targetOrgDoc = targetOrgSnapshot.docs[0];
+        const targetOrgData = targetOrgDoc.data();
+
+        userResponse.orgname    = orgname;
+        userResponse.orgId      = targetOrgData.orgId      || targetOrgDoc.id;
+        userResponse.clientId   = targetOrgData.clientId   || "";
+        userResponse.clientSecret = targetOrgData.clientSecret || "";
+        userResponse.region     = targetOrgData.region     || userFound.region;
+
+        console.log(
+          `🏢 Supervisor sesión en org: ${orgname} | orgId: ${userResponse.orgId} | clientId: ${userResponse.clientId}`,
+        );
+      }
     }
 
     return res.status(200).json({
       success: true,
       message: "Login exitoso",
-      user: userFound,
+      user: userResponse,
       token: tokens,
     });
   } catch (error) {
@@ -322,6 +399,8 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
     console.error("❌ Error al obtener billing overview:", error);
 
     let errorMessage = "Error inesperado al obtener billing overview";
+    const details = error.body || error;
+
     if (error.body && error.body.message) {
       errorMessage = error.body.message;
     } else if (error.text) {
@@ -330,10 +409,12 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
       errorMessage = error.message;
     }
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       success: false,
       error: errorMessage,
-      details: error.body || {},
+      details: details,
+      code: error.body?.code || error.code,
+      contextId: error.body?.contextId || error.contextId,
     });
   }
 });
@@ -426,6 +507,8 @@ app.post("/api/billableusage", async (req, res) => {
 
     // El SDK de Genesys suele incluir el detalle del error en error.body o error.text
     let errorMessage = "Error inesperado al obtener billable usage";
+    const details = error.body || error;
+
     if (error.body && error.body.message) {
       errorMessage = error.body.message;
     } else if (error.text) {
@@ -434,10 +517,12 @@ app.post("/api/billableusage", async (req, res) => {
       errorMessage = error.message;
     }
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       success: false,
       error: errorMessage,
-      details: error.body || {},
+      details: details,
+      code: error.body?.code || error.code,
+      contextId: error.body?.contextId || error.contextId,
     });
   }
 });
