@@ -8,7 +8,11 @@ const app = express();
 const port = process.env.PORT || 4000;
 
 // Middlewares
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 const bcrypt = require("bcryptjs");
