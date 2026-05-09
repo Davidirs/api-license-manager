@@ -1,6 +1,38 @@
 const cron = require("node-cron");
+const platformClient = require("purecloud-platform-client-v2");
 const { db } = require("../firebase");
 const { enqueueEmail } = require("./emailQueue");
+
+// Mapa de regiones al SDK de Genesys
+const REGION_MAP = {
+  "us-east-1":     platformClient.PureCloudRegionHosts.us_east_1,
+  "us-west-2":     platformClient.PureCloudRegionHosts.us_west_2,
+  "us-east-2":     platformClient.PureCloudRegionHosts.us_east_2,
+  "ca-central-1":  platformClient.PureCloudRegionHosts.ca_central_1,
+  "sa-east-1":     platformClient.PureCloudRegionHosts.sa_east_1,
+  "eu-west-1":     platformClient.PureCloudRegionHosts.eu_west_1,
+  "eu-central-1":  platformClient.PureCloudRegionHosts.eu_central_1,
+  "eu-west-2":     platformClient.PureCloudRegionHosts.eu_west_2,
+  "eu-central-2":  platformClient.PureCloudRegionHosts.eu_central_2,
+  "ap-south-1":    platformClient.PureCloudRegionHosts.ap_south_1,
+  "ap-northeast-1":platformClient.PureCloudRegionHosts.ap_northeast_1,
+  "ap-northeast-2":platformClient.PureCloudRegionHosts.ap_northeast_2,
+  "ap-northeast-3":platformClient.PureCloudRegionHosts.ap_northeast_3,
+  "ap-southeast-2":platformClient.PureCloudRegionHosts.ap_southeast_2,
+  "me-central-1":  platformClient.PureCloudRegionHosts.me_central_1,
+};
+
+/**
+ * Obtiene un token de Genesys directamente vía SDK,
+ * sin depender de una llamada HTTP interna (que falla en Docker).
+ */
+async function getGenesysToken(clientId, clientSecret, region) {
+  const client = platformClient.ApiClient.instance;
+  const url = REGION_MAP[region] || platformClient.PureCloudRegionHosts.us_east_1;
+  client.setEnvironment(url);
+  await client.loginClientCredentialsGrant(clientId, clientSecret);
+  return client.authData.accessToken;
+}
 
 function esUnDiaDespues(fechaFacturacionISO) {
   if (!fechaFacturacionISO) return false;
@@ -56,29 +88,15 @@ async function runDailyMonitor() {
       }
     });
 
-    // 3. Obtener Tokens
+    // 3. Obtener Tokens directamente vía SDK (sin HTTP interno)
     let tokens = {};
-    const API_URL = "http://localhost:4000";
+    const API_URL = process.env.API_INTERNAL_URL || `http://localhost:${process.env.PORT || 4000}`;
 
     for (const cred of credentials) {
       try {
-        const response = await fetch(`${API_URL}/api/token`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            clientId: cred.clientId,
-            clientSecret: cred.clientSecret,
-            region: cred.region,
-          }),
-        });
-
-        const resData = await response.json();
-        if (resData.success && resData.token) {
-          tokens[cred.name] = resData.token;
-          console.log(`✅ [Cron] Token obtenido para thrusted: ${cred.name}`);
-        } else {
-          console.error(`❌ [Cron] Fallo token para ${cred.name}`, resData);
-        }
+        const token = await getGenesysToken(cred.clientId, cred.clientSecret, cred.region);
+        tokens[cred.name] = token;
+        console.log(`✅ [Cron] Token obtenido para thrusted: ${cred.name}`);
       } catch (e) {
         console.error(
           `❌ [Cron] Error al pedir token de ${cred.name}`,
@@ -165,6 +183,7 @@ async function runDailyMonitor() {
         );
         continue;
       }
+      // Nota: API_URL se usa solo para /api/trusteebillingoverview (el token ya no necesita HTTP)
 
       // Validamos si acaba de cambiar el periodo
 
