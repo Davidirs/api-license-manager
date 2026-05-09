@@ -5,21 +5,21 @@ const { enqueueEmail } = require("./emailQueue");
 
 // Mapa de regiones al SDK de Genesys
 const REGION_MAP = {
-  "us-east-1":     platformClient.PureCloudRegionHosts.us_east_1,
-  "us-west-2":     platformClient.PureCloudRegionHosts.us_west_2,
-  "us-east-2":     platformClient.PureCloudRegionHosts.us_east_2,
-  "ca-central-1":  platformClient.PureCloudRegionHosts.ca_central_1,
-  "sa-east-1":     platformClient.PureCloudRegionHosts.sa_east_1,
-  "eu-west-1":     platformClient.PureCloudRegionHosts.eu_west_1,
-  "eu-central-1":  platformClient.PureCloudRegionHosts.eu_central_1,
-  "eu-west-2":     platformClient.PureCloudRegionHosts.eu_west_2,
-  "eu-central-2":  platformClient.PureCloudRegionHosts.eu_central_2,
-  "ap-south-1":    platformClient.PureCloudRegionHosts.ap_south_1,
-  "ap-northeast-1":platformClient.PureCloudRegionHosts.ap_northeast_1,
-  "ap-northeast-2":platformClient.PureCloudRegionHosts.ap_northeast_2,
-  "ap-northeast-3":platformClient.PureCloudRegionHosts.ap_northeast_3,
-  "ap-southeast-2":platformClient.PureCloudRegionHosts.ap_southeast_2,
-  "me-central-1":  platformClient.PureCloudRegionHosts.me_central_1,
+  "us-east-1": platformClient.PureCloudRegionHosts.us_east_1,
+  "us-west-2": platformClient.PureCloudRegionHosts.us_west_2,
+  "us-east-2": platformClient.PureCloudRegionHosts.us_east_2,
+  "ca-central-1": platformClient.PureCloudRegionHosts.ca_central_1,
+  "sa-east-1": platformClient.PureCloudRegionHosts.sa_east_1,
+  "eu-west-1": platformClient.PureCloudRegionHosts.eu_west_1,
+  "eu-central-1": platformClient.PureCloudRegionHosts.eu_central_1,
+  "eu-west-2": platformClient.PureCloudRegionHosts.eu_west_2,
+  "eu-central-2": platformClient.PureCloudRegionHosts.eu_central_2,
+  "ap-south-1": platformClient.PureCloudRegionHosts.ap_south_1,
+  "ap-northeast-1": platformClient.PureCloudRegionHosts.ap_northeast_1,
+  "ap-northeast-2": platformClient.PureCloudRegionHosts.ap_northeast_2,
+  "ap-northeast-3": platformClient.PureCloudRegionHosts.ap_northeast_3,
+  "ap-southeast-2": platformClient.PureCloudRegionHosts.ap_southeast_2,
+  "me-central-1": platformClient.PureCloudRegionHosts.me_central_1,
 };
 
 /**
@@ -28,7 +28,8 @@ const REGION_MAP = {
  */
 async function getGenesysToken(clientId, clientSecret, region) {
   const client = platformClient.ApiClient.instance;
-  const url = REGION_MAP[region] || platformClient.PureCloudRegionHosts.us_east_1;
+  const url =
+    REGION_MAP[region] || platformClient.PureCloudRegionHosts.us_east_1;
   client.setEnvironment(url);
   await client.loginClientCredentialsGrant(clientId, clientSecret);
   return client.authData.accessToken;
@@ -87,14 +88,21 @@ async function runDailyMonitor() {
         credentials.push(cred);
       }
     });
+    console.log(`credentials: ${credentials}`);
 
     // 3. Obtener Tokens directamente vía SDK (sin HTTP interno)
     let tokens = {};
-    const API_URL = process.env.API_INTERNAL_URL || `http://localhost:${process.env.PORT || 4000}`;
-
+    const API_URL =
+      process.env.API_INTERNAL_URL ||
+      `http://localhost:${process.env.PORT || 4000}`;
+    console.log("API_URL", API_URL);
     for (const cred of credentials) {
       try {
-        const token = await getGenesysToken(cred.clientId, cred.clientSecret, cred.region);
+        const token = await getGenesysToken(
+          cred.clientId,
+          cred.clientSecret,
+          cred.region,
+        );
         tokens[cred.name] = token;
         console.log(`✅ [Cron] Token obtenido para thrusted: ${cred.name}`);
       } catch (e) {
