@@ -21,9 +21,13 @@ let connection = null;
 if (useQueue) {
   const redisConfig = {
     host: process.env.REDIS_HOST || "localhost",
-    port: process.env.REDIS_PORT || 6379,
+    port: Number(process.env.REDIS_PORT) || 6379,
     maxRetriesPerRequest: null,
   };
+
+  if (process.env.REDIS_USERNAME) {
+    redisConfig.username = process.env.REDIS_USERNAME;
+  }
 
   if (process.env.REDIS_PASSWORD) {
     redisConfig.password = process.env.REDIS_PASSWORD;
