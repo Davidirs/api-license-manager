@@ -335,14 +335,19 @@ async function runDailyMonitor() {
           const weekdayMap = {
             Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
           };
-          const currentDay  = weekdayMap[tzWeekday] ?? nowUTC.getDay();
-          const currentHour = `${tzHour}:${tzMinute}`;
+          const currentDay = weekdayMap[tzWeekday] ?? nowUTC.getDay();
+
+          // Comparamos solo la HORA (no los minutos) porque el cron se ejecuta
+          // a las :00 de cada hora y puede tardar varios minutos en procesar todos los usuarios.
+          // Si comparáramos HH:MM exacto, los últimos usuarios en la iteración serían ignorados.
+          const userHour    = userTime.split(":")[0];   // "11" de "11:00"
+          const currentHour = tzHour;                   // hora local del usuario en el servidor
 
           console.log(
-            `[Cron] 🕐 Usuario ${username} | TZ: ${userTimezone} | Hora local: ${currentHour} | Hora configurada: ${userTime} | Día: ${currentDay}`,
+            `[Cron] 🕐 Usuario ${username} | TZ: ${userTimezone} | Hora local: ${currentHour}:${tzMinute} | Hora configurada: ${userTime} | Día: ${currentDay}`,
           );
 
-          if (userTime === currentHour) {
+          if (userHour === currentHour) {
             if (isDayAfterBilling) {
               console.log(
                 `[Cron] 📅 Enviando reporte ANTERIOR (previous) a ${username} (Inicia nuevo periodo)`,
