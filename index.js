@@ -8,11 +8,13 @@ const app = express();
 const port = process.env.PORT || 4000;
 
 // Middlewares
-app.use(cors({
-  origin: true,
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 app.use(express.json());
 
 const bcrypt = require("bcryptjs");
@@ -20,6 +22,13 @@ const bcrypt = require("bcryptjs");
 // Importar configuración de Firebase
 const { db } = require("./firebase");
 
+// Importar plantillas de correo
+const {
+  generateTemplate,
+  generateNotificationEmailTemplate,
+} = require("./utils/emailTemplates");
+
+const { formatTrusteeBilling } = require("./utils/formatTrusteeBilling");
 // Inicializar Resend
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -184,26 +193,35 @@ app.post("/api/login", async (req, res) => {
     // Si es supervisor, sobrescribir orgname, orgId, clientId, clientSecret y region
     // con los datos de la organización a la que está iniciando sesión,
     // ya que puede navegar en cualquier org hija de su thrusted
-    if (userFound.role === "supervisor") {
-      const targetOrgSnapshot = await db
-        .collection("organizations")
-        .where("orgname", "==", orgname)
-        .get();
+    console.log(
+      `🔎 Buscando org en colección 'organizations' con orgname: '${orgname}'`,
+    );
+    const targetOrgSnapshot = await db
+      .collection("organizations")
+      .where("orgname", "==", orgname)
+      .get();
 
-      if (!targetOrgSnapshot.empty) {
-        const targetOrgDoc = targetOrgSnapshot.docs[0];
-        const targetOrgData = targetOrgDoc.data();
+    if (!targetOrgSnapshot.empty) {
+      const targetOrgDoc = targetOrgSnapshot.docs[0];
+      const targetOrgData = targetOrgDoc.data();
+      // Necesito obtener el token de la org
+      const orgToken = await getTokenForRegion(
+        targetOrgData.clientId,
+        targetOrgData.clientSecret,
+        targetOrgData.region,
+      );
+      userResponse.orgname = orgname;
+      userResponse.orgId = targetOrgData.orgId || targetOrgDoc.id;
+      userResponse.region = targetOrgData.region || userFound.region;
+      userResponse.orgToken = orgToken;
 
-        userResponse.orgname    = orgname;
-        userResponse.orgId      = targetOrgData.orgId      || targetOrgDoc.id;
-        userResponse.clientId   = targetOrgData.clientId   || "";
-        userResponse.clientSecret = targetOrgData.clientSecret || "";
-        userResponse.region     = targetOrgData.region     || userFound.region;
-
-        console.log(
-          `🏢 Supervisor sesión en org: ${orgname} | orgId: ${userResponse.orgId} | clientId: ${userResponse.clientId}`,
-        );
-      }
+      console.log(
+        `🏢 Org encontrada: ${orgname} | orgId: ${userResponse.orgId} | orgToken generado: ${!!orgToken}`,
+      );
+    } else {
+      console.log(
+        `❌ No se encontró la organización '${orgname}' en la colección 'organizations'. El token no se añadirá.`,
+      );
     }
 
     return res.status(200).json({
@@ -308,9 +326,24 @@ app.post("/api/token", async (req, res) => {
   }
 });
 
+const { initCron, runDailyMonitor } = require("./services/cronOrchestrator");
+
 // Iniciar el servidor
 app.listen(port, () => {
   console.log(`✅ API de Node.js corriendo en http://localhost:${port}`);
+  initCron();
+});
+
+// Endpoint de prueba para forzar el orquestador
+app.get("/api/test-cron", async (req, res) => {
+  console.log("Forzando ejecución del Cron desde endpoint de prueba...");
+  // Lo ejecutamos asíncronamente en background para no bloquear el request
+  runDailyMonitor().catch((err) => console.error(err));
+  return res.json({
+    success: true,
+    message:
+      "El orquestador de cron se inició en background. Revisa la consola.",
+  });
 });
 
 // Endpoint para obtener Trustee Billing Overview
@@ -394,10 +427,13 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
       opts,
     );
 
+    const customerFormated = formatTrusteeBilling(data);
+
     console.log("✅ Billing overview obtenido para:", trustorOrgId);
     return res.status(200).json({
       success: true,
       data,
+      customer: customerFormated,
     });
   } catch (error) {
     console.error("❌ Error al obtener billing overview:", error);
@@ -854,13 +890,14 @@ app.post("/api/setuser", async (req, res) => {
 
 // Endpoint para enviar correos usando Resend
 app.post("/api/sendmail", async (req, res) => {
-  const { to, subject, message } = req.body;
+  let { to, subject, message, templateType, templateData, isNotification } =
+    req.body;
 
   // Establece el remitente fijo
   const fromEmail =
     "License Manager <notificaciones@genesys-metrics.cambialapp.com>";
 
-  if (!to || !subject || !message || !Array.isArray(to) || to.length === 0) {
+  if (!to || !Array.isArray(to) || to.length === 0) {
     return res.status(400).json({
       success: false,
       message:
@@ -869,6 +906,29 @@ app.post("/api/sendmail", async (req, res) => {
   }
 
   try {
+    // Si se recibe un templateType, generamos el HTML en el backend
+    if (templateType && templateData) {
+      let template;
+      if (isNotification) {
+        template = generateNotificationEmailTemplate(
+          templateType,
+          templateData,
+        );
+      } else {
+        template = generateTemplate(templateType, templateData);
+      }
+      subject = template.subject;
+      message = template.html;
+    }
+
+    if (!subject || !message) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Faltan parámetros de subject o message, o el template no se generó correctamente.",
+      });
+    }
+
     const { data, error } = await resend.emails.send({
       from: fromEmail,
       to: to,
