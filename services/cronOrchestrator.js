@@ -313,13 +313,34 @@ async function runDailyMonitor() {
           }
 
           // --- LÓGICA DE FRECUENCIA REGULAR (Días y Hora) ---
-          const now = new Date();
-          const currentHour =
-            now.getHours().toString().padStart(2, "0") + ":00";
-          const currentDay = now.getDay();
-
           const userTime = u.preferences.notificationTime || "08:00";
           const userDays = u.preferences.notificationDays || [];
+          const userTimezone = u.preferences.timezone || "UTC";
+
+          // Convertir la hora UTC del servidor a la hora local del usuario
+          const nowUTC = new Date();
+          const formatter = new Intl.DateTimeFormat("en-US", {
+            timeZone: userTimezone,
+            hour: "2-digit",
+            minute: "2-digit",
+            weekday: "short",
+            hour12: false,
+          });
+          const parts = formatter.formatToParts(nowUTC);
+          const tzHour   = parts.find(p => p.type === "hour")?.value   || "00";
+          const tzMinute = parts.find(p => p.type === "minute")?.value || "00";
+          const tzWeekday = parts.find(p => p.type === "weekday")?.value || "";
+
+          // Mapear el día abreviado en inglés al número JS (0=Dom, 1=Lun, …, 6=Sáb)
+          const weekdayMap = {
+            Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+          };
+          const currentDay  = weekdayMap[tzWeekday] ?? nowUTC.getDay();
+          const currentHour = `${tzHour}:${tzMinute}`;
+
+          console.log(
+            `[Cron] 🕐 Usuario ${username} | TZ: ${userTimezone} | Hora local: ${currentHour} | Hora configurada: ${userTime} | Día: ${currentDay}`,
+          );
 
           if (userTime === currentHour) {
             if (isDayAfterBilling) {
