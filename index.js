@@ -75,24 +75,32 @@ app.post("/api/login", async (req, res) => {
     );
 
     // Si no es admin, validar permisos
+    let effectiveThrusted = userFound.thrusted; // Por defecto el del usuario (puede ser array en supervisor)
+
     if (userFound.role !== "administrator") {
       let hasAccess = false;
 
-      // Si es supervisor, puede entrar a cualquier organización que pertenezca a su 'thrusted'
+      // Si es supervisor, puede entrar a cualquier organización que pertenezca a su 'thrusted' (puede ser string o array)
       if (userFound.role === "supervisor") {
         console.log(
           `🔍 [Supervisor] Buscando org "${orgname}" con thrusted="${userFound.thrusted}" en colección organizations...`,
         );
-        const orgSnapshot = await db
-          .collection("organizations")
-          .where("orgname", "==", orgname)
-          .where("thrusted", "==", userFound.thrusted)
-          .get();
+        let orgQuery = db.collection("organizations").where("orgname", "==", orgname);
+        
+        if (Array.isArray(userFound.thrusted)) {
+          // Firebase 'in' soporta hasta 10 elementos.
+          orgQuery = orgQuery.where("thrusted", "in", userFound.thrusted);
+        } else {
+          orgQuery = orgQuery.where("thrusted", "==", userFound.thrusted);
+        }
+
+        const orgSnapshot = await orgQuery.get();
 
         if (!orgSnapshot.empty) {
           hasAccess = true;
+          effectiveThrusted = orgSnapshot.docs[0].data().thrusted; // Tomamos el thrusted real de la organización
           console.log(
-            `✅ [Supervisor] Org encontrada: "${orgname}" pertenece al thrusted "${userFound.thrusted}"`,
+            `✅ [Supervisor] Org encontrada: "${orgname}" pertenece al thrusted "${effectiveThrusted}"`,
           );
         } else {
           console.warn(
@@ -168,15 +176,16 @@ app.post("/api/login", async (req, res) => {
       console.log("✅ Todos los tokens obtenidos:", Object.keys(tokens));
     } else {
       console.log(
-        `🔑 Obteniendo token para región (thrusted): ${userFound.thrusted}`,
+        `🔑 Obteniendo token para región (thrusted efectivo): ${effectiveThrusted}`,
       );
       const orgCred = regionEnvMap.find(
-        (cred) => cred.name === userFound.thrusted,
+        (cred) => cred.name === effectiveThrusted,
       );
+
       if (!orgCred) {
         return res.status(500).json({
           success: false,
-          message: `Credenciales no encontradas para thrusted: ${userFound.thrusted}`,
+          message: `No se encontraron credenciales para la región ${effectiveThrusted}`,
         });
       }
       tokens = await getTokenForRegion(

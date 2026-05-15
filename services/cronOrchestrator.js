@@ -113,42 +113,93 @@ async function runDailyMonitor() {
       }
     }
 
-    // 4. Agrupar usuarios válidos por organización (orgId)
+    // 4. Obtener organizaciones reales desde la BD
+    const orgsSnapshot = await db.collection("organizations").get();
+    const allOrgsDict = {};
+    orgsSnapshot.forEach((doc) => {
+      const data = doc.data();
+      if (data.orgId) {
+        allOrgsDict[data.orgId] = data;
+      }
+    });
+
+    // 5. Agrupar usuarios válidos por organización (orgId)
     const orgsMap = {};
     const isDev = (process.env.ENTORNO || "DEV") === "DEV";
+    console.log("isDev", isDev);
     const allowedOrgs = ["wuzi", "lcpr"];
+    console.log("allowedOrgs", allowedOrgs);
 
     for (const u of allUsers) {
       if (
         isDev &&
         (!u || !allowedOrgs.includes((u.orgname || "").toLowerCase()))
       ) {
-        continue;
+        // En DEV, si el usuario primario no está en allowedOrgs, igual evaluamos
+        // si tiene suscripciones válidas más abajo, pero por simplicidad permitimos pasar.
+        // NOTA: Para no romper DEV, solo limitamos si NO es supervisor
+        if (u.role !== "supervisor") continue;
       }
+
       if (!u || !u.preferences || !u.preferences.emailNotifications) {
         continue;
       }
 
-      const orgId = u.orgId;
-      if (!orgId) continue;
-
-      if (!orgsMap[orgId]) {
-        orgsMap[orgId] = {
-          orgId: orgId,
-          orgname: u.orgname,
-          thrustedName: u.thrusted,
-          region: u.region,
-          users: [],
-        };
+      // Determinar a qué orgs pertenece este usuario para notificaciones
+      let targetOrgs = [];
+      if (
+        (u.role === "supervisor" || u.role === "administrator") &&
+        u.preferences.subscribedOrgs &&
+        u.preferences.subscribedOrgs.length > 0
+      ) {
+        targetOrgs = u.preferences.subscribedOrgs;
+      } else if (u.orgId) {
+        targetOrgs = [u.orgId];
       }
-      orgsMap[orgId].users.push(u);
+
+      for (const orgId of targetOrgs) {
+        // Para crear la caja de org, necesitamos datos fiables de esa org
+        const orgInfo = allOrgsDict[orgId];
+
+        // Si no tenemos info de la org en la colección organizations,
+        // y es el orgId principal del usuario, usamos los datos del usuario como fallback.
+        const orgName = orgInfo ? orgInfo.orgname : u.orgname;
+
+        if (isDev && !allowedOrgs.includes((orgName || "").toLowerCase())) {
+          continue; // En DEV saltamos orgs que no son de prueba
+        }
+
+        if (!orgsMap[orgId]) {
+          orgsMap[orgId] = {
+            orgId: orgId,
+            orgname: orgName,
+            thrustedName: orgInfo ? orgInfo.thrusted : u.thrusted, // Ojo, thrustedName puede ser string aquí (o array, pero Genesys usa el token del nombre)
+            region: orgInfo ? orgInfo.region : u.region,
+            users: [],
+          };
+
+          // Si el thrusted de orgInfo resulta ser un array, tomamos el primero o el que matchee
+          if (Array.isArray(orgsMap[orgId].thrustedName)) {
+            orgsMap[orgId].thrustedName = orgsMap[orgId].thrustedName[0];
+          }
+        }
+
+        // Evitamos duplicados si el array de suscripción tiene el orgId y tmb es su org principal
+        if (
+          !orgsMap[orgId].users.find(
+            (existingU) => existingU.username === u.username,
+          )
+        ) {
+          orgsMap[orgId].users.push(u);
+        }
+      }
     }
 
     console.log(
       `[Cron] Se evaluarán ${Object.keys(orgsMap).length} organizaciones con alertas habilitadas.`,
     );
 
-    // 5. Iterar por organización (Pedimos Billing 1 sola vez por org)
+    // 6. Iterar por organización (Pedimos Billing 1 sola vez por org)
     for (const orgId in orgsMap) {
       const orgData = orgsMap[orgId];
       const token = tokens[orgData.thrustedName];
@@ -327,21 +378,29 @@ async function runDailyMonitor() {
             hour12: false,
           });
           const parts = formatter.formatToParts(nowUTC);
-          const tzHour   = parts.find(p => p.type === "hour")?.value   || "00";
-          const tzMinute = parts.find(p => p.type === "minute")?.value || "00";
-          const tzWeekday = parts.find(p => p.type === "weekday")?.value || "";
+          const tzHour = parts.find((p) => p.type === "hour")?.value || "00";
+          const tzMinute =
+            parts.find((p) => p.type === "minute")?.value || "00";
+          const tzWeekday =
+            parts.find((p) => p.type === "weekday")?.value || "";
 
           // Mapear el día abreviado en inglés al número JS (0=Dom, 1=Lun, …, 6=Sáb)
           const weekdayMap = {
-            Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+            Sun: 0,
+            Mon: 1,
+            Tue: 2,
+            Wed: 3,
+            Thu: 4,
+            Fri: 5,
+            Sat: 6,
           };
           const currentDay = weekdayMap[tzWeekday] ?? nowUTC.getDay();
 
           // Comparamos solo la HORA (no los minutos) porque el cron se ejecuta
           // a las :00 de cada hora y puede tardar varios minutos en procesar todos los usuarios.
           // Si comparáramos HH:MM exacto, los últimos usuarios en la iteración serían ignorados.
-          const userHour    = userTime.split(":")[0];   // "11" de "11:00"
-          const currentHour = tzHour;                   // hora local del usuario en el servidor
+          const userHour = userTime.split(":")[0]; // "11" de "11:00"
+          const currentHour = tzHour; // hora local del usuario en el servidor
 
           console.log(
             `[Cron] 🕐 Usuario ${username} | TZ: ${userTimezone} | Hora local: ${currentHour}:${tzMinute} | Hora configurada: ${userTime} | Día: ${currentDay}`,
