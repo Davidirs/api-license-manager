@@ -49,7 +49,12 @@ function formatTrusteeBilling(billingData) {
     "X Public Post Response",
   ];
 
-  const listNameDevices = ["Genesys Cloud Static WebRTC TURN Charge"];
+  const listNameDevices = [
+    "Genesys Cloud Static WebRTC TURN Charge",
+    "Genesys Cloud Communicate Stand-alone Phone",
+  ];
+
+  //const apps
 
   const listNameResources = [
     "BYOT Rate A",
@@ -61,6 +66,19 @@ function formatTrusteeBilling(billingData) {
     "Genesys Cloud Voice Transcription",
     "Genesys Cloud IVR Basic Per Minute Charge",
     "Genesys Cloud API Resource",
+    "Genesys AudioHook Monitor",
+    "Genesys Cloud Extended Voice Transcription",
+    "Genesys Cloud for Instagram Messaging",
+    "Genesys Cloud for Voice Transcription Fair Use (Legacy)",
+    "Genesys Cloud for Voice Transcription Fair Use",
+    "Genesys Cloud for WhatsApp Messaging",
+    "Genesys Enhanced TTS Standard Voice",
+    "Genesys Enhanced TTS Wavenet Voice",
+    "Journey Management Per Event Charge",
+    "Outbound Email Monthly",
+    "TrueEngage Omnichannel Web & App Customer Contact",
+    "Genesys Cloud IVR Basic Per Minute Charge",
+    "Genesys Cloud API Resource Usage",
   ];
 
   const listNameAddons = [
@@ -200,14 +218,14 @@ function formatTrusteeBilling(billingData) {
             ? token.usageQuantity - token.prepayQuantity
             : 0
           : token.usageQuantity > tokensUnified.incluido
-          ? token.usageQuantity - tokensUnified.incluido
-          : 0;
+            ? token.usageQuantity - tokensUnified.incluido
+            : 0;
     }
   }
 
   const storage = buscarPorNombre(
     billingData.usages || [],
-    "Genesys Cloud Data Storage"
+    "Genesys Cloud Data Storage",
   );
 
   const customerData = {

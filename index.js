@@ -85,13 +85,28 @@ app.post("/api/login", async (req, res) => {
         console.log(
           `🔍 [Supervisor] Buscando org "${orgname}" con thrusted="${userFound.thrusted}" en colección organizations...`,
         );
-        let orgQuery = db.collection("organizations").where("orgname", "==", orgname);
-        
+        let orgQuery = db
+          .collection("organizations")
+          .where("orgname", "==", orgname);
+
+        // Normalizar thrusted: puede ser string simple, string con comas, o array real
+        let thrustedList = [];
         if (Array.isArray(userFound.thrusted)) {
-          // Firebase 'in' soporta hasta 10 elementos.
-          orgQuery = orgQuery.where("thrusted", "in", userFound.thrusted);
+          thrustedList = userFound.thrusted;
+        } else if (
+          typeof userFound.thrusted === "string" &&
+          userFound.thrusted.includes(",")
+        ) {
+          thrustedList = userFound.thrusted.split(",").map((s) => s.trim());
         } else {
-          orgQuery = orgQuery.where("thrusted", "==", userFound.thrusted);
+          thrustedList = [userFound.thrusted];
+        }
+
+        if (thrustedList.length > 1) {
+          // Firebase 'in' soporta hasta 10 elementos.
+          orgQuery = orgQuery.where("thrusted", "in", thrustedList);
+        } else {
+          orgQuery = orgQuery.where("thrusted", "==", thrustedList[0]);
         }
 
         const orgSnapshot = await orgQuery.get();
@@ -178,9 +193,36 @@ app.post("/api/login", async (req, res) => {
       console.log(
         `🔑 Obteniendo token para región (thrusted efectivo): ${effectiveThrusted}`,
       );
-      const orgCred = regionEnvMap.find(
-        (cred) => cred.name === effectiveThrusted,
+
+      // Normalizar effectiveThrusted: puede ser string simple, string con comas, o array
+      let thrustedCandidates = [];
+      if (Array.isArray(effectiveThrusted)) {
+        thrustedCandidates = effectiveThrusted;
+      } else if (
+        typeof effectiveThrusted === "string" &&
+        effectiveThrusted.includes(",")
+      ) {
+        // Ej: "ESMT-DEV,ESMT-DEV-W2" → ["ESMT-DEV", "ESMT-DEV-W2"]
+        thrustedCandidates = effectiveThrusted.split(",").map((s) => s.trim());
+      } else {
+        thrustedCandidates = [effectiveThrusted];
+      }
+
+      console.log(
+        `🔍 Buscando credenciales para candidatos: [${thrustedCandidates.join(", ")}]`,
       );
+
+      let orgCred = null;
+      for (const candidate of thrustedCandidates) {
+        const found = regionEnvMap.find((cred) => cred.name === candidate);
+        if (found) {
+          orgCred = found;
+          console.log(
+            `✅ Credencial encontrada para candidato: "${candidate}"`,
+          );
+          break;
+        }
+      }
 
       if (!orgCred) {
         return res.status(500).json({
@@ -634,71 +676,106 @@ const getRegionUrl = (region) => {
   return url;
 };
 
-const formatUsersDivision = (data) => {
-  const listUsers = data.results.map((user) => ({
-    divisionId: user.divisionId,
-    email: user.contactInfo?.email_main?.[0]?.value || "",
-    uuid: user.guid,
-  }));
+// Memoria caché para usuarios (TTL 5 minutos)
+const userCache = new Map();
+
+async function getAllUsersCached(accessToken, region, forceRefresh = false) {
+  const cacheKey = `${accessToken}_${region}`;
+  
+  if (forceRefresh) {
+    console.log("🔄 Force refresh solicitado, limpiando caché...");
+    userCache.delete(cacheKey);
+  }
+
+  const cached = userCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiry) {
+    console.log("✅ Usando lista de usuarios desde caché en memoria");
+    return cached.data;
+  }
+
+  console.log("🔍 Obteniendo todos los usuarios de Genesys API (GET /api/v2/users)...");
+  const regionUrl = getRegionUrl(region);
+  let allUsers = [];
+  let pageNumber = 1;
+  let totalPages = 1;
+
+  try {
+    do {
+      const response = await fetch(
+        `${regionUrl}/api/v2/users?pageSize=100&pageNumber=${pageNumber}&expand=dateLastLogin,presence&state=active`,
+        {
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch users from Genesys: ${response.status}`);
+      }
+      const result = await response.json();
+      if (pageNumber === 1 && result.pageCount) totalPages = result.pageCount;
+      if (result.entities && result.entities.length > 0) {
+        allUsers = [...allUsers, ...result.entities];
+      }
+      pageNumber++;
+    } while (pageNumber <= totalPages);
+    
+    console.log(`✅ Total users fetched from API: ${allUsers.length}`);
+    
+    // Guardar en caché por 5 minutos (300000 ms)
+    userCache.set(cacheKey, { data: allUsers, expiry: Date.now() + 300000 });
+    return allUsers;
+  } catch (err) {
+    console.error("Error fetching users for cache", err);
+    return [];
+  }
+}
+
+const formatUsersDivision = (allUsers) => {
+  // Debug: log the first user's presence to understand the data structure
+  const firstWithPresence = allUsers.find(u => u.presence);
+  if (firstWithPresence) {
+    console.log("Sample presence object:", JSON.stringify(firstWithPresence.presence, null, 2));
+  }
+
+  const listUsers = allUsers.map((user) => {
+    const sysPresence = user.presence?.presenceDefinition?.systemPresence;
+    // Consider connected if presence exists and is not Offline (case-insensitive)
+    const isConnected = !!sysPresence && sysPresence.toUpperCase() !== "OFFLINE";
+    
+    return {
+      divisionId: user.division?.id,
+      email: user.email || "",
+      uuid: user.id,
+      isConnected,
+    };
+  });
   // agrupar por divisionID
   return listUsers.reduce((acc, user) => {
-    if (!acc[user.divisionId]) {
-      acc[user.divisionId] = [];
+    if (user.divisionId) {
+      if (!acc[user.divisionId]) {
+        acc[user.divisionId] = [];
+      }
+      acc[user.divisionId].push(user);
     }
-    acc[user.divisionId].push(user);
     return acc;
   }, {});
 };
 
-async function getUsersDivision(accessToken, region) {
+async function getUsersDivision(accessToken, region, forceRefresh = false) {
   try {
-    let allResults = [];
-    let pageNumber = 1;
-    let totalPages = 1;
-
-    do {
-      const response = await fetch(`${getRegionUrl(region)}/api/v2/search`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({
-          pageSize: 100,
-          pageNumber: pageNumber,
-          returnFields: ["divisionId", "email"],
-          types: ["users"],
-          query: [
-            {
-              type: "MATCH_ALL",
-              fields: ["email"],
-            },
-          ],
-        }),
-      });
-      const result = await response.json();
-
-      if (pageNumber === 1 && result.pageCount) {
-        totalPages = result.pageCount;
-      }
-
-      if (result.results && result.results.length > 0) {
-        allResults = [...allResults, ...result.results];
-      }
-
-      pageNumber++;
-    } while (pageNumber <= totalPages);
-
-    console.log("Total users fetched:", allResults.length);
-    return formatUsersDivision({ results: allResults });
+    const allUsers = await getAllUsersCached(accessToken, region, forceRefresh);
+    return formatUsersDivision(allUsers);
   } catch (error) {
     console.error("⚠️ Error al obtener usuarios:", error);
     return {};
   }
 }
 
-const formatDivisions = async (data, accessToken, region) => {
-  const divisiones = await getUsersDivision(accessToken, region);
+const formatDivisions = async (data, accessToken, region, forceRefresh = false) => {
+  const divisiones = await getUsersDivision(accessToken, region, forceRefresh);
 
   return data.entities.map((division) => ({
     id: division.id,
@@ -708,7 +785,7 @@ const formatDivisions = async (data, accessToken, region) => {
   }));
 };
 
-async function getDivisions(accessToken, region) {
+async function getDivisions(accessToken, region, forceRefresh = false) {
   try {
     const regionUrl = getRegionUrl(region);
     const response = await fetch(
@@ -722,7 +799,7 @@ async function getDivisions(accessToken, region) {
       },
     );
     const result = await response.json();
-    return await formatDivisions(result, accessToken, region);
+    return await formatDivisions(result, accessToken, region, forceRefresh);
   } catch (error) {
     console.error("⚠️ Error al obtener divisiones:", error);
     throw error;
@@ -732,7 +809,7 @@ async function getDivisions(accessToken, region) {
 // Endpoint para obtener Divisions Data
 app.post("/api/divisionsdata", async (req, res) => {
   try {
-    const { accessToken, region } = req.body;
+    const { accessToken, region, forceRefresh } = req.body;
 
     if (!accessToken || !region) {
       return res.status(400).json({
@@ -741,7 +818,7 @@ app.post("/api/divisionsdata", async (req, res) => {
       });
     }
 
-    const dataFormated = await getDivisions(accessToken, region);
+    const dataFormated = await getDivisions(accessToken, region, forceRefresh);
 
     console.log("✅ Divisions data obtenida");
     return res.status(200).json(dataFormated); // Nota: AWS Lambda devolvía el arreglo directamente
@@ -751,6 +828,253 @@ app.post("/api/divisionsdata", async (req, res) => {
       success: false,
       message: error.message || "Error interno del servidor",
     });
+  }
+});
+
+// Endpoint para obtener Daily Logins
+app.get("/api/reports/daily-logins", async (req, res) => {
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    let url = getRegionUrl(region);
+
+    // Obtener offset de la zona horaria
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const formatterStart = new Intl.DateTimeFormat("en-US", {
+          timeZone: timezone,
+          timeZoneName: "longOffset",
+        });
+        const tzStrStart = formatterStart
+          .formatToParts(new Date(`${startDate}T12:00:00Z`))
+          .find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStrStart.replace("GMT", "");
+        if (offsetStart === "") offsetStart = "Z";
+
+        const formatterEnd = new Intl.DateTimeFormat("en-US", {
+          timeZone: timezone,
+          timeZoneName: "longOffset",
+        });
+        const tzStrEnd = formatterEnd
+          .formatToParts(new Date(`${endDate}T12:00:00Z`))
+          .find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzStrEnd.replace("GMT", "");
+        if (offsetEnd === "") offsetEnd = "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    // Obtener todos los usuarios de la organización
+    const divisionsObj = await getUsersDivision(accessToken, region);
+    let allUserIds = [];
+    for (const divId in divisionsObj) {
+      divisionsObj[divId].forEach((u) => {
+        if (u.uuid) allUserIds.push(u.uuid);
+      });
+    }
+
+    // Generar Esqueleto
+    const dailyCounts = {};
+    const start = new Date(`${startDate}T12:00:00Z`);
+    const end = new Date(`${endDate}T12:00:00Z`);
+    const daysOfWeek = [
+      "Domingo",
+      "Lunes",
+      "Martes",
+      "Miércoles",
+      "Jueves",
+      "Viernes",
+      "Sábado",
+    ];
+
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const dateKey = d.toISOString().split("T")[0];
+      dailyCounts[dateKey] = 0;
+    }
+
+    let totalUniqueLoginsInPeriod = 0;
+    const uniqueUsersSet = new Set();
+    const chunkErrors = []; // Collect errors per chunk for frontend debug
+
+    if (allUserIds.length > 0) {
+      const chunkSize = 100;
+      const chunks = [];
+      for (let i = 0; i < allUserIds.length; i += chunkSize) {
+        chunks.push(allUserIds.slice(i, i + chunkSize));
+      }
+
+      for (const chunk of chunks) {
+        const predicates = chunk.map((id) => ({
+          type: "dimension",
+          dimension: "userId",
+          operator: "matches",
+          value: id,
+        }));
+
+        const payload = {
+          interval: interval,
+          granularity: "P1D",
+          groupBy: ["userId"],
+          metrics: ["tSystemPresence"],
+          filter: {
+            type: "or",
+            predicates: predicates,
+          },
+        };
+
+        const response = await fetch(
+          `${url}/api/v2/analytics/users/aggregates/query`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify(payload),
+          },
+        );
+
+        const genesysResponse = await response.json();
+
+        if (response.ok && genesysResponse.results) {
+          genesysResponse.results.forEach((userResult) => {
+            let userHasLogin = false;
+            if (userResult.data) {
+              userResult.data.forEach((dayData) => {
+                const dateKey = dayData.interval.split("T")[0];
+                if (dayData.metrics && dayData.metrics.length > 0) {
+                  const hasActivePresence = dayData.metrics.some(
+                    (m) =>
+                      m.metric === "tSystemPresence" &&
+                      m.qualifier !== "OFFLINE" &&
+                      m.stats &&
+                      (m.stats.count > 0 || m.stats.sum > 0),
+                  );
+
+                  if (hasActivePresence) {
+                    if (dailyCounts[dateKey] !== undefined) {
+                      dailyCounts[dateKey] += 1;
+                    }
+                    userHasLogin = true;
+                  }
+                }
+              });
+            }
+            if (userHasLogin && userResult.group && userResult.group.userId) {
+              uniqueUsersSet.add(userResult.group.userId);
+            }
+          });
+        } else if (!response.ok) {
+          console.error(
+            "Error from Genesys aggregations API for chunk:",
+            genesysResponse,
+          );
+          chunkErrors.push({
+            status: genesysResponse.status,
+            code: genesysResponse.code,
+            message: genesysResponse.message,
+            contextId: genesysResponse.contextId,
+          });
+        }
+      }
+    }
+
+    totalUniqueLoginsInPeriod = uniqueUsersSet.size;
+
+    const dailyData = Object.keys(dailyCounts).map((date) => {
+      const dateObj = new Date(`${date}T12:00:00Z`);
+      return {
+        date: date,
+        dayOfWeek: daysOfWeek[dateObj.getUTCDay()],
+        activeUsers: dailyCounts[date],
+      };
+    });
+
+    // Detectar si los errores impiden obtener datos reales
+    const permissionErrors = chunkErrors.filter((e) => e.status === 403);
+    const hasPermissionError = permissionErrors.length > 0;
+    const allChunksFailedWithPermission =
+      hasPermissionError &&
+      chunkErrors.length >= Math.ceil(allUserIds.length / 100);
+
+    return res.status(200).json({
+      success: true,
+      period: { start: startDate, end: endDate },
+      totalUniqueLoginsInPeriod,
+      dailyData,
+      warning: hasPermissionError
+        ? {
+            code: "missing_permission",
+            message: permissionErrors[0].message,
+            affectedChunks: permissionErrors.length,
+            totalChunks: chunkErrors.length,
+            dataReliable: !allChunksFailedWithPermission,
+          }
+        : undefined,
+      debug: chunkErrors.length > 0 ? { chunkErrors } : undefined,
+    });
+  } catch (error) {
+    console.error("Error en daily-logins:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint: Reporte de último login de todos los usuarios
+app.get("/api/reports/last-login", async (req, res) => {
+  try {
+    const { accessToken, region } = req.query;
+
+    if (!accessToken || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren accessToken y region",
+      });
+    }
+
+    const allUsers = await getAllUsersCached(accessToken, region);
+
+    // Mapear al formato de reporte
+    const users = allUsers.map((u) => ({
+      id: u.id,
+      name: u.name || `${u.firstName || ""} ${u.lastName || ""}`.trim(),
+      email: u.email || "",
+      department: u.department || "",
+      division: u.division?.name || "",
+      lastLogin: u.dateLastLogin,
+      state: u.state || "active",
+    }));
+
+    // Ordenar: usuarios con lastLogin primero (más reciente arriba), luego los sin login
+    users.sort((a, b) => {
+      if (!a.lastLogin && !b.lastLogin) return 0;
+      if (!a.lastLogin) return 1;
+      if (!b.lastLogin) return -1;
+      return new Date(b.lastLogin).getTime() - new Date(a.lastLogin).getTime();
+    });
+
+    return res.status(200).json({
+      success: true,
+      totalUsers: users.length,
+      users,
+    });
+  } catch (error) {
+    console.error("Error en last-login report:", error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
