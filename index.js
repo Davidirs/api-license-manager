@@ -1196,9 +1196,19 @@ app.post("/api/setuser", async (req, res) => {
         message: `Usuario ${cleanUsername} creado exitosamente.`,
       });
     } else {
-      // Update
-      const updates = { ...userToCreate, orgname: orgname };
-      delete updates.password; // Prevenir guardado plano
+      // Update: solo guardamos los campos seguros del usuario.
+      // orgId, orgToken, region y criticalMetrics se gestionan a nivel de organización
+      // y NO deben sobreescribirse desde el perfil del usuario.
+      const {
+        orgId: _orgId,
+        orgToken: _orgToken,
+        region: _region,
+        criticalMetrics: _criticalMetrics,
+        password: _password,
+        ...safeUserFields
+      } = userToCreate;
+
+      const updates = { ...safeUserFields, orgname };
 
       // Si el usuario provee una nueva contraseña (no vacía)
       if (userData.password && userData.password.trim() !== "") {

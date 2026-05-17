@@ -115,34 +115,45 @@ async function runDailyMonitor() {
 
     // 4. Obtener organizaciones reales desde la BD
     const orgsSnapshot = await db.collection("organizations").get();
-    const allOrgsDict = {};
+    const allOrgsDict = {};     // orgId   → orgData
+    const allOrgsByName = {};   // orgname (lower) → orgData
     orgsSnapshot.forEach((doc) => {
       const data = doc.data();
       if (data.orgId) {
-        allOrgsDict[data.orgId] = data;
+        const entry = { ...data, _docId: doc.id };
+        allOrgsDict[data.orgId] = entry;
+        if (data.orgname) {
+          allOrgsByName[(data.orgname || "").toLowerCase()] = entry;
+        }
       }
     });
 
     // 5. Agrupar usuarios válidos por organización (orgId)
     const orgsMap = {};
-    const isDev = (process.env.ENTORNO || "DEV") === "DEV";
+    const isDev = process.env.ENTORNO === "DEV";
     console.log("isDev", isDev);
     const allowedOrgs = ["wuzi", "lcpr"];
     console.log("allowedOrgs", allowedOrgs);
 
     for (const u of allUsers) {
-      if (
-        isDev &&
-        (!u || !allowedOrgs.includes((u.orgname || "").toLowerCase()))
-      ) {
-        // En DEV, si el usuario primario no está en allowedOrgs, igual evaluamos
-        // si tiene suscripciones válidas más abajo, pero por simplicidad permitimos pasar.
-        // NOTA: Para no romper DEV, solo limitamos si NO es supervisor
-        if (u.role !== "supervisor") continue;
-      }
-
       if (!u || !u.preferences || !u.preferences.emailNotifications) {
         continue;
+      }
+
+      // En DEV, filtrar por allowedOrgs (tanto para supervisors como clients)
+      if (isDev) {
+        const userOrgname = (u.orgname || "").toLowerCase();
+        const subscribedToAllowed =
+          u.preferences.subscribedOrgs &&
+          u.preferences.subscribedOrgs.some((orgId) => {
+            const orgInfo = allOrgsDict[orgId];
+            return orgInfo && allowedOrgs.includes((orgInfo.orgname || "").toLowerCase());
+          });
+        const isOwnOrgAllowed = allowedOrgs.includes(userOrgname);
+
+        if (!isOwnOrgAllowed && !subscribedToAllowed) {
+          continue; // Saltar en DEV si no pertenece a ninguna org permitida
+        }
       }
 
       // Determinar a qué orgs pertenece este usuario para notificaciones
@@ -152,39 +163,44 @@ async function runDailyMonitor() {
         u.preferences.subscribedOrgs &&
         u.preferences.subscribedOrgs.length > 0
       ) {
+        // Supervisor/admin: notifica sobre todas las orgs que sigue (por orgId)
         targetOrgs = u.preferences.subscribedOrgs;
+      } else if (u.role === "client" && u.orgname) {
+        // Client: no tiene orgId, resolvemos a través de su orgname
+        const orgByName = allOrgsByName[(u.orgname || "").toLowerCase()];
+        if (orgByName) {
+          targetOrgs = [orgByName.orgId];
+        } else {
+          console.warn(`[Cron] Client ${u.username} tiene orgname "${u.orgname}" pero no se encontró en organizations. Saltando.`);
+        }
       } else if (u.orgId) {
+        // Supervisor sin suscripciones u otros roles con orgId
         targetOrgs = [u.orgId];
       }
 
       for (const orgId of targetOrgs) {
-        // Para crear la caja de org, necesitamos datos fiables de esa org
         const orgInfo = allOrgsDict[orgId];
-
-        // Si no tenemos info de la org en la colección organizations,
-        // y es el orgId principal del usuario, usamos los datos del usuario como fallback.
         const orgName = orgInfo ? orgInfo.orgname : u.orgname;
 
         if (isDev && !allowedOrgs.includes((orgName || "").toLowerCase())) {
-          continue; // En DEV saltamos orgs que no son de prueba
+          continue;
         }
 
         if (!orgsMap[orgId]) {
           orgsMap[orgId] = {
             orgId: orgId,
             orgname: orgName,
-            thrustedName: orgInfo ? orgInfo.thrusted : u.thrusted, // Ojo, thrustedName puede ser string aquí (o array, pero Genesys usa el token del nombre)
+            thrustedName: orgInfo ? orgInfo.thrusted : u.thrusted,
             region: orgInfo ? orgInfo.region : u.region,
             users: [],
           };
 
-          // Si el thrusted de orgInfo resulta ser un array, tomamos el primero o el que matchee
           if (Array.isArray(orgsMap[orgId].thrustedName)) {
             orgsMap[orgId].thrustedName = orgsMap[orgId].thrustedName[0];
           }
         }
 
-        // Evitamos duplicados si el array de suscripción tiene el orgId y tmb es su org principal
+        // Evitamos duplicados
         if (
           !orgsMap[orgId].users.find(
             (existingU) => existingU.username === u.username,
@@ -211,6 +227,7 @@ async function runDailyMonitor() {
         continue;
       }
 
+      // --- Obtener billing de la org ---
       let clientData = null;
       try {
         const currentBillingRes = await fetch(
@@ -242,133 +259,157 @@ async function runDailyMonitor() {
         );
         continue;
       }
-      // Nota: API_URL se usa solo para /api/trusteebillingoverview (el token ya no necesita HTTP)
-
-      // Validamos si acaba de cambiar el periodo
 
       const isDayAfterBilling = clientData.facturacion
         ? esUnDiaDespues(clientData.facturacion.final)
         : false;
 
-      // 6. Iterar sobre cada usuario de esta organización
+      // ── PASO A: Calcular criticalMetrics UNA SOLA VEZ para la org ──────────
+      // Usamos el alertThreshold más bajo entre los usuarios (más conservador = más seguro)
+      const minThreshold = orgData.users.reduce((min, u) => {
+        const t = u.preferences?.alertThreshold || 90;
+        return t < min ? t : min;
+      }, 100);
+
+      const calculatePercentage = (used, total) => {
+        if (total === 0 && used === 0) return 0;
+        return Math.round((used / total) * 100);
+      };
+
+      const newCriticalMetrics = [];
+
+      if (clientData.licencias) {
+        clientData.licencias.forEach((lic) => {
+          const licUsed = Number(lic.usageQuantity || 0);
+          const licTotal = Number(lic.prepayQuantity || 0);
+          const licPercentage = calculatePercentage(licUsed, licTotal);
+          if (licTotal === 0 && licUsed > 0) {
+            newCriticalMetrics.push(`${lic.name}: ${licUsed}`);
+          } else if (licPercentage >= minThreshold) {
+            newCriticalMetrics.push(`${lic.name}: ${licPercentage}%`);
+          }
+        });
+      }
+
+      if (clientData.addons) {
+        clientData.addons.forEach((addon) => {
+          const addonUsed = Number(addon.usageQuantity || 0);
+          const addonTotal = Number(addon.prepayQuantity || 0);
+          const addonPercentage = calculatePercentage(addonUsed, addonTotal);
+          if (addonTotal === 0 && addonUsed > 0) {
+            newCriticalMetrics.push(`${addon.name}: ${addonUsed}`);
+          } else if (addonPercentage >= minThreshold) {
+            newCriticalMetrics.push(`${addon.name}: ${addonPercentage}%`);
+          }
+        });
+      }
+
+      if (clientData.storage) {
+        const storageUsed = Number(clientData.storage.enUso || 0);
+        const storageTotal = Number(clientData.storage.comprometido || 0);
+        const storagePercentage = calculatePercentage(storageUsed, storageTotal);
+        if (storagePercentage >= minThreshold) {
+          newCriticalMetrics.push(`Storage: ${storagePercentage}%`);
+        }
+      }
+
+      if (clientData.iaTokens) {
+        const tokensUsed = Number(clientData.iaTokens.usageQuantity || 0);
+        const tokensTotal = Number(clientData.iaTokens.prepayQuantity || 0);
+        const tokensIncluido = Number(clientData.iaTokens.incluido || 0);
+        let tokensPercentage = 0;
+        if (tokensIncluido > 0) {
+          tokensPercentage = Math.round(
+            (tokensUsed / (tokensTotal + tokensIncluido)) * 100,
+          );
+        } else {
+          tokensPercentage = calculatePercentage(tokensUsed, tokensTotal);
+        }
+        if (tokensPercentage >= minThreshold) {
+          newCriticalMetrics.push(`IA Tokens: ${tokensPercentage}%`);
+        }
+      }
+
+      // ── PASO B: Leer criticalMetrics anteriores desde organizations/{orgId} ─
+      // Comparamos AQUÍ, antes de tocar Firestore, para que todos los usuarios
+      // sean notificados con el mismo estado.
+      const sortAndStringify = (arr) =>
+        arr ? [...arr].sort().join("|") : "";
+
+      const orgDocRef = db.collection("organizations").doc(orgId);
+      const orgDoc = await orgDocRef.get();
+      const prevCriticalMetrics = orgDoc.exists
+        ? orgDoc.data().criticalMetrics || []
+        : [];
+
+      const prevStringified = sortAndStringify(prevCriticalMetrics);
+      const newStringified = sortAndStringify(newCriticalMetrics);
+      const alertChanged = prevStringified !== newStringified;
+
+      console.log(
+        `[Cron] Org ${orgData.orgname} | Métricas anteriores: "${prevStringified}" | Nuevas: "${newStringified}" | Cambió: ${alertChanged}`,
+      );
+
+      // ── PASO C: Notificar a TODOS los usuarios ANTES de escribir en Firestore ─
+      // Garantizamos que todos reciban la alerta; solo al final se actualiza el estado.
+      if (alertChanged && newCriticalMetrics.length > 0) {
+        console.log(
+          `[Cron] 🚨 Nueva excedencia en org ${orgData.orgname}. Notificando a ${orgData.users.length} usuarios...`,
+        );
+        const alertPayload = { ...clientData, criticalMetrics: newCriticalMetrics };
+
+        for (const u of orgData.users) {
+          const recipients = u.preferences?.recipients || [];
+          if (recipients.length === 0) continue;
+          try {
+            await enqueueEmail("alert", alertPayload, recipients, true);
+            console.log(
+              `[Cron]   ✉️  Alerta enviada a ${u.username || u.id} (${u.orgname})`,
+            );
+          } catch (err) {
+            console.error(
+              `[Cron] Error enviando alerta a ${u.username || u.id}:`,
+              err.message,
+            );
+          }
+        }
+      } else if (alertChanged && newCriticalMetrics.length === 0) {
+        console.log(
+          `[Cron] 🟢 Excedencia superada en org ${orgData.orgname}. Limpiando métricas.`,
+        );
+      } else {
+        console.log(
+          `[Cron] 💤 Sin cambios en métricas para org ${orgData.orgname}. No se re-envía alerta.`,
+        );
+      }
+
+      // ── PASO D: Actualizar criticalMetrics en organizations/{orgId} ─────────
+      // Solo se escribe DESPUÉS de haber notificado a todos los usuarios.
+      if (alertChanged) {
+        try {
+          await orgDocRef.set({ criticalMetrics: newCriticalMetrics }, { merge: true });
+          console.log(
+            `[Cron] 💾 criticalMetrics actualizado en organizations/${orgId}`,
+          );
+        } catch (err) {
+          console.error(
+            `[Cron] Error actualizando criticalMetrics en org ${orgId}:`,
+            err.message,
+          );
+        }
+      }
+
+      // ── PASO E: Notificaciones regulares por usuario (días/hora configurados) ─
       for (const u of orgData.users) {
         const username = u.username || u.id;
         try {
-          const recipients = u.preferences.recipients || [];
+          const recipients = u.preferences?.recipients || [];
           if (recipients.length === 0) continue;
 
-          // --- LÓGICA DE ALERTAS INDIVIDUALES ---
-          const alertThreshold = u.preferences.alertThreshold || 90;
-          const criticalMetrics = [];
-
-          const calculatePercentage = (used, total) => {
-            if (total === 0 && used === 0) return 0;
-            return Math.round((used / total) * 100);
-          };
-
-          if (clientData.licencias) {
-            clientData.licencias.forEach((lic) => {
-              const licUsed = Number(lic.usageQuantity || 0);
-              const licTotal = Number(lic.prepayQuantity || 0);
-              const licPercentage = calculatePercentage(licUsed, licTotal);
-              if (licTotal === 0 && licUsed > 0) {
-                criticalMetrics.push(`${lic.name}: ${licUsed}`);
-              } else if (licPercentage >= alertThreshold) {
-                criticalMetrics.push(`${lic.name}: ${licPercentage}%`);
-              }
-            });
-          }
-
-          if (clientData.addons) {
-            clientData.addons.forEach((addon) => {
-              const addonUsed = Number(addon.usageQuantity || 0);
-              const addonTotal = Number(addon.prepayQuantity || 0);
-              const addonPercentage = calculatePercentage(
-                addonUsed,
-                addonTotal,
-              );
-              if (addonTotal === 0 && addonUsed > 0) {
-                criticalMetrics.push(`${addon.name}: ${addonUsed}`);
-              } else if (addonPercentage >= alertThreshold) {
-                criticalMetrics.push(`${addon.name}: ${addonPercentage}%`);
-              }
-            });
-          }
-
-          if (clientData.storage) {
-            const storageUsed = Number(clientData.storage.enUso || 0);
-            const storageTotal = Number(clientData.storage.comprometido || 0);
-            const storagePercentage = calculatePercentage(
-              storageUsed,
-              storageTotal,
-            );
-            if (storagePercentage >= alertThreshold) {
-              criticalMetrics.push(`Storage: ${storagePercentage}%`);
-            }
-          }
-
-          if (clientData.iaTokens) {
-            const tokensUsed = Number(clientData.iaTokens.usageQuantity || 0);
-            const tokensTotal = Number(clientData.iaTokens.prepayQuantity || 0);
-            const tokensIncluido = Number(clientData.iaTokens.incluido || 0);
-            let tokensPercentage = 0;
-            if (tokensIncluido > 0) {
-              tokensPercentage = Math.round(
-                (tokensUsed / (tokensTotal + tokensIncluido)) * 100,
-              );
-            } else {
-              tokensPercentage = calculatePercentage(tokensUsed, tokensTotal);
-            }
-            if (tokensPercentage >= alertThreshold) {
-              criticalMetrics.push(`IA Tokens: ${tokensPercentage}%`);
-            }
-          }
-
-          if (criticalMetrics.length > 0) {
-            const sortAndStringify = (arr) =>
-              arr ? [...arr].sort().join("|") : "";
-
-            const currentCriticalMetrics = u.criticalMetrics || [];
-            const currentStringified = sortAndStringify(currentCriticalMetrics);
-            const newStringified = sortAndStringify(criticalMetrics);
-
-            const shouldUpdate = currentStringified !== newStringified;
-
-            if (shouldUpdate) {
-              console.log(
-                `[Cron] 🚨 Alerta nueva para el usuario ${u.username} (${u.orgname}). Actualizando Firebase y enviando email...`,
-              );
-              await db
-                .collection("users")
-                .doc(u.id)
-                .update({ criticalMetrics });
-
-              // Clonamos clientData para no sobreescribir criticalMetrics para otros usuarios de la misma org
-              const userDataPayload = { ...clientData, criticalMetrics };
-              await enqueueEmail("alert", userDataPayload, recipients, true);
-            } else {
-              console.log(
-                `[Cron] 💤 Alerta repetida para el usuario ${u.username} (${u.orgname}). No se re-enviará.`,
-              );
-            }
-          } else {
-            if (u.criticalMetrics && u.criticalMetrics.length > 0) {
-              await db
-                .collection("users")
-                .doc(u.id)
-                .update({ criticalMetrics: [] });
-              console.log(
-                `[Cron] 🟢 Alerta superada para el usuario ${u.username} (${u.orgname}). Limpiando Firebase.`,
-              );
-            }
-          }
-
-          // --- LÓGICA DE FRECUENCIA REGULAR (Días y Hora) ---
           const userTime = u.preferences.notificationTime || "08:00";
           const userDays = u.preferences.notificationDays || [];
           const userTimezone = u.preferences.timezone || "UTC";
 
-          // Convertir la hora UTC del servidor a la hora local del usuario
           const nowUTC = new Date();
           const formatter = new Intl.DateTimeFormat("en-US", {
             timeZone: userTimezone,
@@ -379,28 +420,13 @@ async function runDailyMonitor() {
           });
           const parts = formatter.formatToParts(nowUTC);
           const tzHour = parts.find((p) => p.type === "hour")?.value || "00";
-          const tzMinute =
-            parts.find((p) => p.type === "minute")?.value || "00";
-          const tzWeekday =
-            parts.find((p) => p.type === "weekday")?.value || "";
+          const tzMinute = parts.find((p) => p.type === "minute")?.value || "00";
+          const tzWeekday = parts.find((p) => p.type === "weekday")?.value || "";
 
-          // Mapear el día abreviado en inglés al número JS (0=Dom, 1=Lun, …, 6=Sáb)
-          const weekdayMap = {
-            Sun: 0,
-            Mon: 1,
-            Tue: 2,
-            Wed: 3,
-            Thu: 4,
-            Fri: 5,
-            Sat: 6,
-          };
+          const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
           const currentDay = weekdayMap[tzWeekday] ?? nowUTC.getDay();
-
-          // Comparamos solo la HORA (no los minutos) porque el cron se ejecuta
-          // a las :00 de cada hora y puede tardar varios minutos en procesar todos los usuarios.
-          // Si comparáramos HH:MM exacto, los últimos usuarios en la iteración serían ignorados.
-          const userHour = userTime.split(":")[0]; // "11" de "11:00"
-          const currentHour = tzHour; // hora local del usuario en el servidor
+          const userHour = userTime.split(":")[0];
+          const currentHour = tzHour;
 
           console.log(
             `[Cron] 🕐 Usuario ${username} | TZ: ${userTimezone} | Hora local: ${currentHour}:${tzMinute} | Hora configurada: ${userTime} | Día: ${currentDay}`,
