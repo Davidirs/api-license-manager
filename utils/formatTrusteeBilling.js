@@ -22,6 +22,7 @@ function formatTrusteeBilling(billingData) {
     "CX Cloud from Genesys and Salesforce Concurrent",
     "DEV Genesys Cloud Partner Lab Bundle BYOC",
     "Journey Management for the Contact Center Concurrent",
+    "Genesys Native Agent Assist Voice Concurrent",
   ];
 
   const listNameAIExperience = [

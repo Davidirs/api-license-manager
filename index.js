@@ -464,9 +464,10 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
       }
     }
 
-    console.log(`Configurando región: ${region}, URL: ${url}`);
+    console.log(`[billing] Configurando región: ${region} | trustorOrgId: ${trustorOrgId}`);
     client.setEnvironment(url);
     client.setAccessToken(accessToken);
+    client.timeout = 60000; // 60s timeout para llamadas al SDK de Genesys
 
     const apiInstance = new platformClient.BillingApi();
     const opts = {
@@ -487,7 +488,7 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
       customer: customerFormated,
     });
   } catch (error) {
-    console.error("❌ Error al obtener billing overview:", error);
+    console.error(`❌ Error al obtener billing overview para trustorOrgId "${req.body?.trustorOrgId}":`, error?.body || error?.message || error);
 
     let errorMessage = "Error inesperado al obtener billing overview";
     const details = error.body || error;
@@ -1168,9 +1169,12 @@ app.post("/api/setuser", async (req, res) => {
       // Creamos/Actualizamos la Organización
       await orgRef.set(
         {
+          orgId: orgId,
           orgname: orgname,
           thrusted: body.thrusted || userToCreate.thrusted || "N/A",
           region: body.region || userToCreate.region || "us-east-1",
+          clientId: body.clientId || userToCreate.clientId || "",
+          clientSecret: body.clientSecret || userToCreate.clientSecret || "",
           criticalMetrics: [],
         },
         { merge: true },
@@ -1183,10 +1187,6 @@ app.post("/api/setuser", async (req, res) => {
         role: userToCreate.role || "client",
         thrusted: userToCreate.thrusted || body.thrusted || "N/A",
         orgname: orgname,
-        orgId: orgId,
-        region: userToCreate.region || body.region || "us-east-1",
-        clientId: userToCreate.clientId || "",
-        clientSecret: userToCreate.clientSecret || "",
         preferences: userToCreate.preferences || {},
       };
       await userRef.set(firestoreUser);

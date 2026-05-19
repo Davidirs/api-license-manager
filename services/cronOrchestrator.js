@@ -230,6 +230,9 @@ async function runDailyMonitor() {
       // --- Obtener billing de la org ---
       let clientData = null;
       try {
+        const abortController = new AbortController();
+        const fetchTimeout = setTimeout(() => abortController.abort(), 60000); // 60s timeout
+
         const currentBillingRes = await fetch(
           `${API_URL}/api/trusteebillingoverview`,
           {
@@ -241,22 +244,30 @@ async function runDailyMonitor() {
               region: orgData.region,
               billingPeriodIndex: 0,
             }),
+            signal: abortController.signal,
           },
         );
+        clearTimeout(fetchTimeout);
 
         const currentData = await currentBillingRes.json();
         if (!currentData || !currentData.customer) {
           console.error(
-            `[Cron] No se obtuvo billing para la org ${orgData.orgname} (${orgId})`,
+            `[Cron] ❌ No se obtuvo billing para la org "${orgData.orgname}" (${orgId}). Respuesta: ${JSON.stringify(currentData)}`,
           );
           continue;
         }
         clientData = currentData.customer;
       } catch (err) {
-        console.error(
-          `[Cron] Error obteniendo billing org ${orgData.orgname}:`,
-          err.message,
-        );
+        if (err.name === "AbortError") {
+          console.error(
+            `[Cron] ⏱️ Timeout (60s) al obtener billing para org "${orgData.orgname}" (${orgId}). Saltando.`,
+          );
+        } else {
+          console.error(
+            `[Cron] ❌ Error obteniendo billing para org "${orgData.orgname}" (${orgId}):`,
+            err.message,
+          );
+        }
         continue;
       }
 
