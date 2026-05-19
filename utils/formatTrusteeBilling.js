@@ -48,6 +48,7 @@ function formatTrusteeBilling(billingData) {
     "X Private Messaging",
     "X Public Post Ingestion",
     "X Public Post Response",
+    "Genesys Agent Copilot",
   ];
 
   const listNameDevices = [

@@ -1035,6 +1035,250 @@ app.get("/api/reports/daily-logins", async (req, res) => {
   }
 });
 
+// Endpoint: Detalles de IA Tokens por División
+app.get("/api/reports/ia-tokens-details", async (req, res) => {
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    let url = getRegionUrl(region);
+
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const formatterStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStrStart = formatterStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStrStart.replace("GMT", "");
+        if (offsetStart === "") offsetStart = "Z";
+
+        const formatterEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStrEnd = formatterEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzStrEnd.replace("GMT", "");
+        if (offsetEnd === "") offsetEnd = "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    // Get Divisions to map IDs to Names
+    const divisionsObj = await getDivisions(accessToken, region, false);
+    const divisionsMap = {};
+    divisionsObj.forEach(div => { divisionsMap[div.id] = div.name; });
+
+    const divisionUsage = {};
+    const initDiv = (divId) => {
+      if (!divisionUsage[divId]) {
+        divisionUsage[divId] = {
+          divisionId: divId,
+          divisionName: divisionsMap[divId] || "Desconocida",
+          botVoiceMin: 0,
+          botDigitalSessions: 0,
+          whatsappSessions: 0,
+          copilotSessions: 0  // Conversations where Agent Copilot could be used
+        };
+      }
+    };
+
+    // 1. Bot Flows Query
+    const botFlowsPayload = {
+      interval: interval,
+      groupBy: ["divisionId", "mediaType"],
+      metrics: ["nFlow", "tFlow"],
+      filter: {
+        type: "or",
+        predicates: [
+          { type: "dimension", dimension: "flowType", operator: "matches", value: "bot" },
+          { type: "dimension", dimension: "flowType", operator: "matches", value: "digitalbot" }
+        ]
+      }
+    };
+    
+    const headers = { 
+      "Content-Type": "application/json", 
+      Authorization: `Bearer ${accessToken}` 
+    };
+
+    const resFlows = await fetch(`${url}/api/v2/analytics/flows/aggregates/query`, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(botFlowsPayload)
+    });
+    
+    if (resFlows.ok) {
+      const dataFlows = await resFlows.json();
+      if (dataFlows.results) {
+        dataFlows.results.forEach(group => {
+          const divId = group.group.divisionId || "Home";
+          const mediaType = group.group.mediaType || "unknown";
+          initDiv(divId);
+          if (divId === "Home") {
+            divisionUsage[divId].divisionName = "Home / Default";
+          }
+          if (group.data && group.data[0] && group.data[0].metrics) {
+            group.data[0].metrics.forEach(m => {
+              if (m.metric === "tFlow" && mediaType === "voice") {
+                divisionUsage[divId].botVoiceMin += (m.stats.sum / 60000); // ms to minutes
+              }
+              if (m.metric === "nFlow" && mediaType !== "voice") {
+                divisionUsage[divId].botDigitalSessions += m.stats.count;
+              }
+            });
+          }
+        });
+      }
+    }
+
+    // 2. WhatsApp Query
+    const waPayload = {
+      interval: interval,
+      groupBy: ["divisionId"],
+      metrics: ["nConnected"],
+      filter: {
+        type: "and",
+        predicates: [
+          { type: "dimension", dimension: "mediaType", operator: "matches", value: "message" },
+          { type: "dimension", dimension: "messageType", operator: "matches", value: "whatsapp" }
+        ]
+      }
+    };
+    
+    const resWa = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(waPayload)
+    });
+
+    if (resWa.ok) {
+      const dataWa = await resWa.json();
+      if (dataWa.results) {
+        dataWa.results.forEach(group => {
+          const divId = group.group.divisionId || "Home";
+          initDiv(divId);
+          if (divId === "Home") {
+            divisionUsage[divId].divisionName = "Home / Default";
+          }
+          if (group.data && group.data[0] && group.data[0].metrics) {
+            group.data[0].metrics.forEach(m => {
+              if (m.metric === "nConnected") {
+                divisionUsage[divId].whatsappSessions += m.stats.count;
+              }
+            });
+          }
+        });
+      }
+    }
+
+    // 3. Copilot Query - Conversaciones de agente (voz + chat + email, sin WhatsApp)
+    // Agent Copilot asiste agentes en interacciones, distribuimos por volumen de conversaciones conectadas por división
+    const copilotPayload = {
+      interval: interval,
+      groupBy: ["divisionId"],
+      metrics: ["nConnected"],
+      filter: {
+        type: "or",
+        predicates: [
+          { type: "dimension", dimension: "mediaType", operator: "matches", value: "voice" },
+          { type: "dimension", dimension: "mediaType", operator: "matches", value: "chat" },
+          { type: "dimension", dimension: "mediaType", operator: "matches", value: "email" }
+        ]
+      }
+    };
+
+    const resCopilot = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(copilotPayload)
+    });
+
+    if (resCopilot.ok) {
+      const dataCopilot = await resCopilot.json();
+      if (dataCopilot.results) {
+        dataCopilot.results.forEach(group => {
+          const divId = group.group.divisionId || "Home";
+          initDiv(divId);
+          if (divId === "Home") divisionUsage[divId].divisionName = "Home / Default";
+          if (group.data && group.data[0] && group.data[0].metrics) {
+            group.data[0].metrics.forEach(m => {
+              if (m.metric === "nConnected") {
+                divisionUsage[divId].copilotSessions += m.stats.count;
+              }
+            });
+          }
+        });
+      }
+    }
+
+    // Prorrateo proporcional usando los totales reales de facturación
+    // El frontend envía los tokens reales facturados por Genesys (de clientData.aiExperience)
+    const billedVoice = parseFloat(req.query.billedVoice) || 0;
+    const billedDigital = parseFloat(req.query.billedDigital) || 0;
+    const billedWa = parseFloat(req.query.billedWa) || 0;
+    const billedCopilot = parseFloat(req.query.billedCopilot) || 0;
+
+    console.log(`💰 Tokens facturados → Voice: ${billedVoice}, Digital: ${billedDigital}, WhatsApp: ${billedWa}, Copilot: ${billedCopilot}`);
+
+    const rawData = Object.values(divisionUsage);
+    const sumVoice = rawData.reduce((acc, r) => acc + r.botVoiceMin, 0);
+    const sumDigital = rawData.reduce((acc, r) => acc + r.botDigitalSessions, 0);
+    const sumWa = rawData.reduce((acc, r) => acc + r.whatsappSessions, 0);
+    const sumCopilot = rawData.reduce((acc, r) => acc + r.copilotSessions, 0);
+
+    console.log(`📊 Totales Analytics → Voice: ${sumVoice.toFixed(2)} min, Digital: ${sumDigital}, WA: ${sumWa}, Copilot convs: ${sumCopilot}`);
+
+    // Si tenemos los totales facturados reales, prorratear. Si no, usar estimaciones con reglas fijas.
+    const useBilledData = billedVoice > 0 || billedDigital > 0 || billedWa > 0 || billedCopilot > 0;
+
+    const responseData = rawData.map(d => {
+      let estimatedVoiceTokens, estimatedDigitalTokens, estimatedWhatsappTokens, estimatedCopilotTokens;
+
+      if (useBilledData) {
+        // PRORRATEO PROPORCIONAL:
+        // Tokens División = (Volumen División / Volumen Total Org) × Tokens Facturados
+        estimatedVoiceTokens = sumVoice > 0 ? Math.round((d.botVoiceMin / sumVoice) * billedVoice) : 0;
+        estimatedDigitalTokens = sumDigital > 0 ? Math.round((d.botDigitalSessions / sumDigital) * billedDigital) : 0;
+        estimatedWhatsappTokens = sumWa > 0 ? Math.round((d.whatsappSessions / sumWa) * billedWa) : 0;
+        estimatedCopilotTokens = sumCopilot > 0 ? Math.round((d.copilotSessions / sumCopilot) * billedCopilot) : 0;
+      } else {
+        // FALLBACK con reglas fijas de Genesys si no hay totales de facturación
+        estimatedVoiceTokens = Math.ceil(d.botVoiceMin / 17);
+        estimatedDigitalTokens = Math.ceil(d.botDigitalSessions / 51);
+        estimatedWhatsappTokens = d.whatsappSessions; // 1 a 1
+        estimatedCopilotTokens = 0;
+      }
+
+      return {
+        ...d,
+        estimatedVoiceTokens,
+        estimatedDigitalTokens,
+        estimatedWhatsappTokens,
+        estimatedCopilotTokens,
+        estimatedTotalTokens: estimatedVoiceTokens + estimatedDigitalTokens + estimatedWhatsappTokens + estimatedCopilotTokens
+      };
+    });
+
+    // Sort by estimatedTotalTokens descending
+    responseData.sort((a, b) => b.estimatedTotalTokens - a.estimatedTotalTokens);
+
+    return res.status(200).json({ success: true, data: responseData });
+
+  } catch (error) {
+    console.error("Error en ia-tokens-details:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Endpoint: Reporte de último login de todos los usuarios
 app.get("/api/reports/last-login", async (req, res) => {
   try {
