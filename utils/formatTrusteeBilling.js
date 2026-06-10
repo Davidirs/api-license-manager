@@ -17,11 +17,14 @@ function formatTrusteeBilling(billingData) {
     "Genesys Cloud CX 1 Digital Concurrent User",
     "Genesys Cloud Collaborate User",
     "Genesys Cloud Communicate User",
+    "Mobile Office for Genesys Cloud",
     "Mobile Office for Genesys Cloud Concurrent",
     "Smart Connector for HubSpot - Named",
+    "CX Cloud from Genesys and Salesforce",
     "CX Cloud from Genesys and Salesforce Concurrent",
     "DEV Genesys Cloud Partner Lab Bundle BYOC",
     "Journey Management for the Contact Center Concurrent",
+    "Genesys Native Agent Assist Voice",
     "Genesys Native Agent Assist Voice Concurrent",
   ];
 
