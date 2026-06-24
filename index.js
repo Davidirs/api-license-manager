@@ -34,6 +34,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 // Helper para obtener token internamente
 async function getTokenForRegion(clientId, clientSecret, region) {
+  console.log(clientId, clientSecret, region);
   const response = await fetch(`http://localhost:${port}/api/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -293,7 +294,7 @@ app.post("/api/login", async (req, res) => {
 app.post("/api/token", async (req, res) => {
   try {
     const { clientId, clientSecret, region } = req.body;
-
+    console.log("region", region);
     // Validar credenciales
     if (!clientId || !clientSecret) {
       return res.status(400).json({
@@ -352,6 +353,9 @@ app.post("/api/token", async (req, res) => {
           break;
         case "me-central-1":
           url = platformClient.PureCloudRegionHosts.me_central_1;
+          break;
+        case "mx-central-1":
+          url = platformClient.PureCloudRegionHosts.mx_central_1;
           break;
         default:
           console.error(`Región no reconocida: ${region}`);
@@ -458,6 +462,9 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
           break;
         case "me-central-1":
           url = platformClient.PureCloudRegionHosts.me_central_1;
+          break;
+        case "mx-central-1":
+          url = platformClient.PureCloudRegionHosts.mx_central_1;
           break;
         default:
           console.error(`Región no reconocida: ${region}`);
@@ -573,6 +580,9 @@ app.post("/api/billableusage", async (req, res) => {
         case "me-central-1":
           url = platformClient.PureCloudRegionHosts.me_central_1;
           break;
+        case "mx-central-1":
+          url = platformClient.PureCloudRegionHosts.mx_central_1;
+          break;
         default:
           console.error(`Región no reconocida: ${region}`);
       }
@@ -669,6 +679,9 @@ const getRegionUrl = (region) => {
       case "me-central-1":
         url = "https://api.mec1.pure.cloud";
         break;
+      case "mx-central-1":
+        url = "https://api.mxc1.pure.cloud";
+        break;
       default:
         console.error(`Región no reconocida: ${region}`);
         url = "null";
@@ -682,7 +695,7 @@ const userCache = new Map();
 
 async function getAllUsersCached(accessToken, region, forceRefresh = false) {
   const cacheKey = `${accessToken}_${region}`;
-  
+
   if (forceRefresh) {
     console.log("🔄 Force refresh solicitado, limpiando caché...");
     userCache.delete(cacheKey);
@@ -722,9 +735,9 @@ async function getAllUsersCached(accessToken, region, forceRefresh = false) {
       }
       pageNumber++;
     } while (pageNumber <= totalPages);
-    
+
     console.log(`✅ Total users fetched from API: ${allUsers.length}`);
-    
+
     // Guardar en caché por 5 minutos (300000 ms)
     userCache.set(cacheKey, { data: allUsers, expiry: Date.now() + 300000 });
     return allUsers;
@@ -745,7 +758,7 @@ const formatUsersDivision = (allUsers) => {
     const sysPresence = user.presence?.presenceDefinition?.systemPresence;
     // Consider connected if presence exists and is not Offline (case-insensitive)
     const isConnected = !!sysPresence && sysPresence.toUpperCase() !== "OFFLINE";
-    
+
     return {
       divisionId: user.division?.id,
       email: user.email || "",
@@ -1020,12 +1033,12 @@ app.get("/api/reports/daily-logins", async (req, res) => {
       dailyData,
       warning: hasPermissionError
         ? {
-            code: "missing_permission",
-            message: permissionErrors[0].message,
-            affectedChunks: permissionErrors.length,
-            totalChunks: chunkErrors.length,
-            dataReliable: !allChunksFailedWithPermission,
-          }
+          code: "missing_permission",
+          message: permissionErrors[0].message,
+          affectedChunks: permissionErrors.length,
+          totalChunks: chunkErrors.length,
+          dataReliable: !allChunksFailedWithPermission,
+        }
         : undefined,
       debug: chunkErrors.length > 0 ? { chunkErrors } : undefined,
     });
@@ -1104,10 +1117,10 @@ app.get("/api/reports/ia-tokens-details", async (req, res) => {
         ]
       }
     };
-    
-    const headers = { 
-      "Content-Type": "application/json", 
-      Authorization: `Bearer ${accessToken}` 
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`
     };
 
     const resFlows = await fetch(`${url}/api/v2/analytics/flows/aggregates/query`, {
@@ -1115,7 +1128,7 @@ app.get("/api/reports/ia-tokens-details", async (req, res) => {
       headers: headers,
       body: JSON.stringify(botFlowsPayload)
     });
-    
+
     if (resFlows.ok) {
       const dataFlows = await resFlows.json();
       if (dataFlows.results) {
@@ -1153,7 +1166,7 @@ app.get("/api/reports/ia-tokens-details", async (req, res) => {
         ]
       }
     };
-    
+
     const resWa = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
       method: "POST",
       headers: headers,
@@ -1279,6 +1292,354 @@ app.get("/api/reports/ia-tokens-details", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint: Auditoría diaria de Bot Flow Voice (granularity P1D)
+// Retorna los minutos de bot de voz por día para el período indicado.
+// Utiliza la misma query que ia-tokens-details pero con granularity "P1D"
+// para obtener el desglose día a día en lugar de un acumulado del mes.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/reports/ia-tokens-daily", async (req, res) => {
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    const url = getRegionUrl(region);
+
+    // ── Timezone offset ───────────────────────────────────────────────────
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const fmtStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStart = fmtStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStart.replace("GMT", "") || "Z";
+
+        const fmtEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzEnd = fmtEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzEnd.replace("GMT", "") || "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset:", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    console.log(`📅 [ia-tokens-daily] interval=${interval}  region=${region}`);
+
+    // ── Build day skeleton (every day in range → 0 minutes) ──────────────
+    const dailyMap = {};
+    const startD = new Date(`${startDate}T12:00:00Z`);
+    const endD = new Date(`${endDate}T12:00:00Z`);
+    for (let d = new Date(startD); d <= endD; d.setDate(d.getDate() + 1)) {
+      dailyMap[d.toISOString().split("T")[0]] = 0;
+    }
+
+    // ── Query Genesys: Bot Flows with P1D granularity ─────────────────────
+    const payload = {
+      interval: interval,
+      granularity: "P1D",               // ← key change vs ia-tokens-details
+      groupBy: ["mediaType"],            // we only care about voice total, not per division
+      metrics: ["tFlow"],
+      filter: {
+        type: "or",
+        predicates: [
+          { type: "dimension", dimension: "flowType", operator: "matches", value: "bot" },
+          { type: "dimension", dimension: "flowType", operator: "matches", value: "digitalbot" },
+        ],
+      },
+    };
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    };
+
+    const resFlows = await fetch(`${url}/api/v2/analytics/flows/aggregates/query`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!resFlows.ok) {
+      const errBody = await resFlows.text();
+      console.error("[ia-tokens-daily] Genesys API error:", errBody);
+      return res.status(502).json({ success: false, error: "Error consultando Genesys Analytics" });
+    }
+
+    const dataFlows = await resFlows.json();
+
+    // ── Aggregate tFlow (ms) per day → convert to minutes ────────────────
+    if (dataFlows.results) {
+      dataFlows.results.forEach((group) => {
+        const mediaType = group.group?.mediaType || "";
+        // Only count voice flows
+        if (mediaType !== "voice") return;
+
+        if (group.data && Array.isArray(group.data)) {
+          group.data.forEach((daySlot) => {
+            // daySlot.interval looks like "2026-06-01T06:00:00.000Z/2026-06-02T06:00:00.000Z"
+            const rawDatePart = daySlot.interval ? daySlot.interval.split("/")[0] : null;
+            if (!rawDatePart) return;
+
+            // Normalize to date key in local timezone if needed
+            // We use the UTC date of the interval start as the key
+            const dateKey = rawDatePart.split("T")[0];
+
+            if (daySlot.metrics && Array.isArray(daySlot.metrics)) {
+              daySlot.metrics.forEach((m) => {
+                if (m.metric === "tFlow" && m.stats?.sum) {
+                  const minutes = m.stats.sum / 60000; // ms → minutes
+                  if (dailyMap[dateKey] !== undefined) {
+                    dailyMap[dateKey] += minutes;
+                  } else {
+                    // Date might fall in timezone-shifted day: try adjacent keys
+                    dailyMap[dateKey] = (dailyMap[dateKey] || 0) + minutes;
+                  }
+                }
+              });
+            }
+          });
+        }
+      });
+    }
+
+    // ── Build response array sorted by date ascending ─────────────────────
+    const data = Object.entries(dailyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, botVoiceMin]) => ({ date, botVoiceMin }));
+
+    console.log(`✅ [ia-tokens-daily] ${data.length} días, total=${data.reduce((s, r) => s + r.botVoiceMin, 0).toFixed(2)} min`);
+
+    return res.status(200).json({ success: true, period: { start: startDate, end: endDate }, data });
+
+  } catch (error) {
+    console.error("Error en ia-tokens-daily:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint para analizar métricas con IA (usando Groq API y API Key del Servidor)
+app.post("/api/analyze-metrics", async (req, res) => {
+  try {
+    const { clientData, dailyLogins, outboundAttempts, overageDetailsText, languageName } = req.body;
+
+    const groqApiKey = process.env.GROQ_API_KEY;
+
+    if (!groqApiKey) {
+      return res.status(500).json({
+        success: false,
+        error: "GROQ_API_KEY no está configurado en el servidor."
+      });
+    }
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas en ${languageName || 'español'}. 
+
+REGLAS DE FORMATO OBLIGATORIAS:
+1. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto del análisis.
+2. Para las listas y puntos, utiliza "1.- " para números o "- " para viñetas, nunca uses "*".
+3. En la sección de Recomendaciones, debes sugerir explícitamente que a través de la opción de "Último Login" (en Conexiones Diarias) el administrador puede detectar usuarios inactivos que no han iniciado sesión en los últimos meses. Recomienda desactivar estas cuentas en la organización de Genesys Cloud para evitar que por algún motivo inicien sesión por error y consuman licencias innecesarias de la organización.
+4. Si se proporciona información de sobreuso de licencias y el detalle de los últimos usuarios que iniciaron sesión, menciónalos en el análisis indicando quiénes fueron los últimos usuarios que registraron actividad y causaron el sobreuso.`;
+
+    const userPrompt = `Analiza las siguientes métricas de Genesys Cloud y proporciona:
+1. Resumen ejecutivo de uso
+2. Estado de KPIs principales (licencias, recursos, storage, IA tokens y Outbound attempts)
+3. Alertas (si hay sobre-uso)
+4. Recomendaciones específicas para optimización
+
+Datos de licencias y uso general:
+${JSON.stringify(clientData, null, 2)}
+
+Resumen de conexiones diarias:
+${JSON.stringify(dailyLogins, null, 2)}
+
+Resumen de intentos outbound y campañas:
+${JSON.stringify(outboundAttempts, null, 2)}
+
+Detalles de sobreuso y últimos inicios de sesión:
+${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqApiKey}`
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 2000
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Groq API error: ${response.status} - ${errText}`);
+    }
+
+    const data = await response.json();
+    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+
+    return res.status(200).json({
+      success: true,
+      analysis: aiText
+    });
+
+  } catch (error) {
+    console.error("Error en analyze-metrics:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint: Intentos Outbound y métricas de campañas
+app.get("/api/reports/outbound-attempts", async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    const url = getRegionUrl(region);
+
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const formatterStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStrStart = formatterStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStrStart.replace("GMT", "");
+        if (offsetStart === "") offsetStart = "Z";
+
+        const formatterEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStrEnd = formatterEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzStrEnd.replace("GMT", "");
+        if (offsetEnd === "") offsetEnd = "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    const payload = {
+      interval: interval,
+      groupBy: ["outboundCampaignId"],
+      metrics: ["nOutboundAttempted"],
+      filter: {
+        type: "and",
+        predicates: [
+          {
+            type: "dimension",
+            dimension: "direction",
+            operator: "matches",
+            value: "outbound"
+          }
+        ]
+      }
+    };
+
+    const response = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Genesys API error: ${response.status} - ${errText}`);
+    }
+
+    const genesysResponse = await response.json();
+    let totalAttempts = 0;
+    const campaigns = [];
+
+    if (genesysResponse.results) {
+      // Collect campaigns and count total
+      for (const result of genesysResponse.results) {
+        const campaignId = result.group?.outboundCampaignId;
+        if (!campaignId) continue;
+
+        let count = 0;
+        if (result.data && result.data[0] && result.data[0].metrics) {
+          const metricObj = result.data[0].metrics.find(m => m.metric === "nOutboundAttempted");
+          if (metricObj && metricObj.stats) {
+            count = metricObj.stats.count || 0;
+          }
+        }
+
+        totalAttempts += count;
+        campaigns.push({
+          id: campaignId,
+          name: campaignId, // fallback to ID
+          attempts: count
+        });
+      }
+
+      // Try to fetch campaign names in parallel
+      try {
+        await Promise.all(campaigns.map(async (camp) => {
+          try {
+            const campRes = await fetch(`${url}/api/v2/outbound/campaigns/${camp.id}`, {
+              method: "GET",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+              }
+            });
+            if (campRes.ok) {
+              const campData = await campRes.json();
+              if (campData && campData.name) {
+                camp.name = campData.name;
+              }
+            }
+          } catch (err) {
+            console.error(`Error fetching name for campaign ${camp.id}:`, err);
+          }
+        }));
+      } catch (err) {
+        console.error("Error batch fetching campaign names:", err);
+      }
+    }
+
+    // Sort campaigns by attempts descending
+    campaigns.sort((a, b) => b.attempts - a.attempts);
+
+    return res.status(200).json({
+      success: true,
+      period: { start: startDate, end: endDate },
+      totalAttempts,
+      campaigns
+    });
+
+  } catch (error) {
+    console.error("Error en outbound-attempts:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Endpoint: Reporte de último login de todos los usuarios
 app.get("/api/reports/last-login", async (req, res) => {
   try {
@@ -1357,9 +1718,9 @@ app.get("/api/setuser", async (req, res) => {
         // Si la organización no fue insertada independientemente, la creamos en memoria para responder
         org = {
           orgname: u.orgname,
-          orgId: u.orgId,
-          region: u.region,
-          thrusted: u.thrusted,
+          orgId: u.orgId || u.orgname || "unknown",
+          region: u.region || "us-east-1",
+          thrusted: u.thrusted || "N/A",
           criticalMetrics: [],
           users: [],
         };
@@ -1399,6 +1760,7 @@ app.post("/api/setuser", async (req, res) => {
 
     const orgId = body.orgId || userToCreate.orgId || orgname;
     const orgRef = db.collection("organizations").doc(orgId);
+    const orgDoc = await orgRef.get();
 
     // Validar si el usuario NO existe y no estamos en modo actualización
     if (!userDoc.exists && mode !== "update") {
@@ -1410,19 +1772,21 @@ app.post("/api/setuser", async (req, res) => {
       }
       const passwordHash = await bcrypt.hash(userData.password, 10);
 
-      // Creamos/Actualizamos la Organización
-      await orgRef.set(
-        {
-          orgId: orgId,
-          orgname: orgname,
-          thrusted: body.thrusted || userToCreate.thrusted || "N/A",
-          region: body.region || userToCreate.region || "us-east-1",
-          clientId: body.clientId || userToCreate.clientId || "",
-          clientSecret: body.clientSecret || userToCreate.clientSecret || "",
-          criticalMetrics: [],
-        },
-        { merge: true },
-      );
+      // Creamos/Actualizamos la Organización si no existe o si se proporcionan credenciales explícitas
+      if (!orgDoc.exists || (body.clientId && body.clientSecret)) {
+        await orgRef.set(
+          {
+            orgId: orgId,
+            orgname: orgname,
+            thrusted: body.thrusted || userToCreate.thrusted || "N/A",
+            region: body.region || userToCreate.region || "us-east-1",
+            clientId: body.clientId || userToCreate.clientId || "",
+            clientSecret: body.clientSecret || userToCreate.clientSecret || "",
+            criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
+          },
+          { merge: true },
+        );
+      }
 
       // Creamos el Usuario
       const firestoreUser = {
@@ -1431,6 +1795,10 @@ app.post("/api/setuser", async (req, res) => {
         role: userToCreate.role || "client",
         thrusted: userToCreate.thrusted || body.thrusted || "N/A",
         orgname: orgname,
+        orgId: orgId,
+        clientId: userToCreate.clientId || body.clientId || (orgDoc.exists ? orgDoc.data().clientId : "") || "",
+        clientSecret: userToCreate.clientSecret || body.clientSecret || (orgDoc.exists ? orgDoc.data().clientSecret : "") || "",
+        region: userToCreate.region || body.region || (orgDoc.exists ? orgDoc.data().region : "us-east-1") || "us-east-1",
         preferences: userToCreate.preferences || {},
       };
       await userRef.set(firestoreUser);
@@ -1453,6 +1821,9 @@ app.post("/api/setuser", async (req, res) => {
       } = userToCreate;
 
       const updates = { ...safeUserFields, orgname };
+      if (orgId) {
+        updates.orgId = orgId;
+      }
 
       // Si el usuario provee una nueva contraseña (no vacía)
       if (userData.password && userData.password.trim() !== "") {
@@ -1467,6 +1838,49 @@ app.post("/api/setuser", async (req, res) => {
     }
   } catch (error) {
     console.error("❌ Error en POST /api/setuser:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      detail: error.message,
+    });
+  }
+});
+
+app.post("/api/organization", async (req, res) => {
+  try {
+    const body = req.body;
+    const { orgId, orgname, thrusted, region, clientId, clientSecret } = body;
+
+    if (!orgId || !orgname) {
+      return res.status(400).json({
+        success: false,
+        message: "orgId y orgname son requeridos",
+      });
+    }
+
+    const cleanOrgId = orgId.trim();
+    const orgRef = db.collection("organizations").doc(cleanOrgId);
+    const orgDoc = await orgRef.get();
+
+    await orgRef.set(
+      {
+        orgId: cleanOrgId,
+        orgname: orgname.trim(),
+        thrusted: thrusted || "N/A",
+        region: region || "us-east-1",
+        clientId: clientId || "",
+        clientSecret: clientSecret || "",
+        criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
+      },
+      { merge: true },
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Organización ${orgname} guardada exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/organization:", error);
     return res.status(500).json({
       success: false,
       message: "Error interno del servidor",
