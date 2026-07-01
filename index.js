@@ -166,6 +166,255 @@ app.post("/api/login", async (req, res) => {
 
     let tokens;
 
+
+    if (userFound.role === "administrator") {
+      // Obtener la colección credenciales
+      const credsSnapshot = await db.collection("credentials").get();
+      const regionEnvMap = credsSnapshot.docs.map((doc) => doc.data());
+      console.log(
+        "🔑 Obteniendo tokens para administrador de todas las regiones",
+      );
+      tokens = {};
+
+      const tokenPromises = regionEnvMap.map(async (org) => {
+        console.log(org)
+        const token = await getTokenForRegion(
+          org.clientId,
+          org.clientSecret,
+          org.region,
+        );
+        return { thrusted: org.name, token };
+      });
+
+      const tokenResults = await Promise.all(tokenPromises);
+      tokenResults.forEach(({ thrusted, token }) => {
+        tokens[thrusted] = token;
+      });
+      //console.log("✅ Todos los tokens obtenidos:", Object.keys(tokens));
+      console.log("✅ Todos los tokens obtenidos:", tokens);
+
+    } else {
+      console.log(
+        `🔑 Obteniendo token para región (thrusted efectivo): ${effectiveThrusted}`,
+      );
+
+      // Normalizar effectiveThrusted: puede ser string simple, string con comas, o array
+      let thrustedCandidates = [];
+      if (Array.isArray(effectiveThrusted)) {
+        thrustedCandidates = effectiveThrusted;
+      } else if (
+        typeof effectiveThrusted === "string" &&
+        effectiveThrusted.includes(",")
+      ) {
+        // Ej: "ESMT-DEV,ESMT-DEV-W2" → ["ESMT-DEV", "ESMT-DEV-W2"]
+        thrustedCandidates = effectiveThrusted.split(",").map((s) => s.trim());
+      } else {
+        thrustedCandidates = [effectiveThrusted];
+      }
+
+      console.log(
+        `🔍 Buscando credenciales para candidatos: [${thrustedCandidates.join(", ")}]`,
+      );
+
+      let orgCred = null;
+      for (const candidate of thrustedCandidates) {
+        const found = regionEnvMap.find((cred) => cred.name === candidate);
+        if (found) {
+          orgCred = found;
+          console.log(
+            `✅ Credencial encontrada para candidato: "${candidate}"`,
+          );
+          break;
+        }
+      }
+
+      if (!orgCred) {
+        return res.status(500).json({
+          success: false,
+          message: `No se encontraron credenciales para la región ${effectiveThrusted}`,
+        });
+      }
+      tokens = await getTokenForRegion(
+        orgCred.clientId,
+        orgCred.clientSecret,
+        orgCred.region,
+      );
+      console.log("Token obtenido:", tokens);
+    }
+
+    // Construir el objeto de usuario a devolver al front
+    let userResponse = { ...userFound };
+
+    // Si es supervisor, sobrescribir orgname, orgId, clientId, clientSecret y region
+    // con los datos de la organización a la que está iniciando sesión,
+    // ya que puede navegar en cualquier org hija de su thrusted
+    console.log(
+      `🔎 Buscando org en colección 'organizations' con orgname: '${orgname}'`,
+    );
+    const targetOrgSnapshot = await db
+      .collection("organizations")
+      .where("orgname", "==", orgname)
+      .get();
+
+    if (!targetOrgSnapshot.empty) {
+      const targetOrgDoc = targetOrgSnapshot.docs[0];
+      const targetOrgData = targetOrgDoc.data();
+      // Necesito obtener el token de la org
+      const orgToken = await getTokenForRegion(
+        targetOrgData.clientId,
+        targetOrgData.clientSecret,
+        targetOrgData.region,
+      );
+      userResponse.orgname = orgname;
+      userResponse.orgId = targetOrgData.orgId || targetOrgDoc.id;
+      userResponse.region = targetOrgData.region || userFound.region;
+      userResponse.orgToken = orgToken;
+
+      console.log(
+        `🏢 Org encontrada: ${orgname} | orgId: ${userResponse.orgId} | orgToken generado: ${!!orgToken}`,
+      );
+    } else {
+      console.log(
+        `❌ No se encontró la organización '${orgname}' en la colección 'organizations'. El token no se añadirá.`,
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Login exitoso",
+      user: userResponse,
+      token: tokens,
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor.",
+      details: error.message,
+    });
+  }
+});
+
+/* 
+backup de login
+app.post("/api/login", async (req, res) => {
+  try {
+    const { orgname, username, password } = req.body;
+    console.log("Login request:", { orgname, username });
+
+    if (!orgname || !username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "orgname, username y password requeridos.",
+      });
+    }
+
+    // Buscar el usuario en la colección users
+    const cleanUsername = username.trim();
+    const userDoc = await db.collection("users").doc(cleanUsername).get();
+
+    if (!userDoc.exists) {
+      return res
+        .status(401)
+        .json({ success: false, message: "Usuario no encontrado." });
+    }
+
+    const userFound = userDoc.data();
+    console.log(
+      `👤 Usuario encontrado: username="${cleanUsername}" | role="${userFound.role}" | orgname="${userFound.orgname}" | thrusted="${userFound.thrusted}"`,
+    );
+
+    // Si no es admin, validar permisos
+    let effectiveThrusted = userFound.thrusted; // Por defecto el del usuario (puede ser array en supervisor)
+
+    if (userFound.role !== "administrator") {
+      let hasAccess = false;
+
+      // Si es supervisor, puede entrar a cualquier organización que pertenezca a su 'thrusted' (puede ser string o array)
+      if (userFound.role === "supervisor") {
+        console.log(
+          `🔍 [Supervisor] Buscando org "${orgname}" con thrusted="${userFound.thrusted}" en colección organizations...`,
+        );
+        let orgQuery = db
+          .collection("organizations")
+          .where("orgname", "==", orgname);
+
+        // Normalizar thrusted: puede ser string simple, string con comas, o array real
+        let thrustedList = [];
+        if (Array.isArray(userFound.thrusted)) {
+          thrustedList = userFound.thrusted;
+        } else if (
+          typeof userFound.thrusted === "string" &&
+          userFound.thrusted.includes(",")
+        ) {
+          thrustedList = userFound.thrusted.split(",").map((s) => s.trim());
+        } else {
+          thrustedList = [userFound.thrusted];
+        }
+
+        if (thrustedList.length > 1) {
+          // Firebase 'in' soporta hasta 10 elementos.
+          orgQuery = orgQuery.where("thrusted", "in", thrustedList);
+        } else {
+          orgQuery = orgQuery.where("thrusted", "==", thrustedList[0]);
+        }
+
+        const orgSnapshot = await orgQuery.get();
+
+        if (!orgSnapshot.empty) {
+          hasAccess = true;
+          effectiveThrusted = orgSnapshot.docs[0].data().thrusted; // Tomamos el thrusted real de la organización
+          console.log(
+            `✅ [Supervisor] Org encontrada: "${orgname}" pertenece al thrusted "${effectiveThrusted}"`,
+          );
+        } else {
+          console.warn(
+            `⚠️ [Supervisor] No se encontró la org "${orgname}" con thrusted="${userFound.thrusted}". Docs encontrados: ${orgSnapshot.size}`,
+          );
+        }
+      }
+
+      // Si es cliente o el supervisor intenta entrar a su propia organización asignada
+      if (!hasAccess && userFound.orgname === orgname) {
+        hasAccess = true;
+        console.log(
+          `✅ [Acceso directo] orgname del usuario ("${userFound.orgname}") coincide con la solicitada ("${orgname}")`,
+        );
+      }
+
+      if (!hasAccess) {
+        console.error(
+          `❌ [Acceso denegado] username="${cleanUsername}" | role="${userFound.role}" | orgname_usuario="${userFound.orgname}" | orgname_solicitada="${orgname}" | thrusted="${userFound.thrusted}"`,
+        );
+        return res.status(401).json({
+          success: false,
+          message:
+            "El usuario no pertenece a la organización especificada o no tiene permisos.",
+        });
+      }
+    } else {
+      console.log(
+        `👑 [Admin] Acceso total concedido a username="${cleanUsername}"`,
+      );
+    }
+
+    // Verificar contraseña
+    console.log(`🔐 Verificando contraseña para "${cleanUsername}"...`);
+    const passwordMatch = await bcrypt.compare(
+      password,
+      userFound.passwordHash,
+    );
+    if (!passwordMatch) {
+      console.error(`❌ [Contraseña incorrecta] username="${cleanUsername}"`);
+      return res
+        .status(401)
+        .json({ success: false, message: "Contraseña incorrecta." });
+    }
+
+    console.log("✅ Login successful for:", { orgname, username });
+
+    let tokens;
+
     // Obtener la colección credenciales
     const credsSnapshot = await db.collection("credentials").get();
     const regionEnvMap = credsSnapshot.docs.map((doc) => doc.data());
@@ -290,11 +539,11 @@ app.post("/api/login", async (req, res) => {
       details: error.message,
     });
   }
-});
+}); */
 app.post("/api/token", async (req, res) => {
   try {
     const { clientId, clientSecret, region } = req.body;
-    console.log("region", region);
+    //console.log("region", region);
     // Validar credenciales
     if (!clientId || !clientSecret) {
       return res.status(400).json({
@@ -362,7 +611,7 @@ app.post("/api/token", async (req, res) => {
       }
     }
 
-    console.log(`Configurando región: ${region}, URL: ${url}`);
+    //console.log(`Configurando región: ${region}, URL: ${url}`);
     client.setEnvironment(url);
 
     // Generar token
@@ -514,6 +763,253 @@ app.post("/api/trusteebillingoverview", async (req, res) => {
       details: details,
       code: error.body?.code || error.code,
       contextId: error.body?.contextId || error.contextId,
+    });
+  }
+});
+
+// Endpoint para obtener Subscription Overview (alternativa que pide enddate/periodEndingTimestamp y accessToken)
+app.post("/api/subscriptionoverview", async (req, res) => {
+  try {
+    const { endDate, accessToken, region } = req.body;
+
+    const actualToken = accessToken;
+    let actualEndDate = endDate;
+
+    if (!actualToken) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requiere accessToken o token en el cuerpo de la petición.",
+      });
+    }
+
+    if (!actualEndDate) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requiere endDate, enddate o periodEndingTimestamp en el cuerpo de la petición.",
+      });
+    }
+
+    // Obtener la URL de la API de Genesys según la región especificada
+    const regionUrl = getRegionUrl(region || "us-east-1");
+    if (!regionUrl || regionUrl === "null") {
+      return res.status(400).json({
+        success: false,
+        error: "Región no válida o no soportada.",
+      });
+    }
+
+    // Helper: fetch con timeout via AbortController
+    const fetchWithTimeout = (url, options = {}, timeoutMs = 20000) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timer));
+    };
+
+    const genesysHeaders = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${actualToken}`,
+    };
+
+    // Convertir a timestamp en milisegundos o resolver palabras clave "current" / "previous"
+    let timestamp;
+    if (actualEndDate === "current") {
+      timestamp = Date.now();
+    } else if (actualEndDate === "previous") {
+      // Para obtener el periodo anterior, consultamos /api/v2/billing/periods
+      // (Genesys no devuelve billingPeriodStartDate en el overview crudo)
+      const periodsUrl = `${regionUrl}/api/v2/billing/periods`;
+      let periodsResponse;
+      try {
+        periodsResponse = await fetchWithTimeout(periodsUrl, { method: "GET", headers: genesysHeaders });
+      } catch (e) {
+        return res.status(504).json({
+          success: false,
+          error: "Timeout al consultar los periodos de facturación de Genesys Cloud.",
+        });
+      }
+
+      if (!periodsResponse.ok) {
+        const errorText = await periodsResponse.text();
+        return res.status(periodsResponse.status).json({
+          success: false,
+          error: "Error al consultar los periodos de facturación de Genesys Cloud.",
+          details: errorText,
+        });
+      }
+
+      const periodsData = await periodsResponse.json();
+      const periods = periodsData.entities || periodsData.periods || periodsData || [];
+
+      if (!Array.isArray(periods) || periods.length < 2) {
+        return res.status(500).json({
+          success: false,
+          error: "No se encontraron suficientes periodos de facturación para determinar el periodo anterior.",
+        });
+      }
+
+      // Ordenar de más reciente a más antiguo por startDate
+      periods.sort((a, b) => new Date(b.startDate) - new Date(a.startDate));
+
+      // El periodo anterior es el segundo en la lista (índice 1)
+      const previousPeriod = periods[1];
+      if (!previousPeriod || !previousPeriod.startDate) {
+        return res.status(500).json({
+          success: false,
+          error: "No se pudo determinar el periodo anterior de facturación.",
+        });
+      }
+
+      // Usar una fecha dentro del periodo anterior (su startDate + 1 día)
+      const previousStart = new Date(previousPeriod.startDate);
+      timestamp = previousStart.getTime() + 24 * 60 * 60 * 1000;
+    } else if (isNaN(actualEndDate)) {
+      const parsedDate = new Date(actualEndDate).getTime();
+      if (isNaN(parsedDate)) {
+        return res.status(400).json({
+          success: false,
+          error: "Formato de fecha inválido. Debe ser 'current', 'previous', un timestamp o una fecha válida (e.g., YYYY-MM-DD).",
+        });
+      }
+      timestamp = parsedDate;
+    } else {
+      timestamp = Number(actualEndDate);
+    }
+
+    // Guardia final: si el timestamp es 0, NaN o negativo, usar la fecha actual
+    if (!timestamp || isNaN(timestamp) || timestamp <= 0) {
+      console.warn(`[subscriptionoverview] Timestamp inválido (${timestamp}) para endDate="${actualEndDate}", usando Date.now()`);
+      timestamp = Date.now();
+    }
+
+    const overviewUrl = `${regionUrl}/api/v2/billing/subscriptionoverview?periodEndingTimestamp=${timestamp}`;
+    const orgUrl = `${regionUrl}/api/v2/organizations/me`;
+
+    // Ejecutar overview + org en paralelo para reducir latencia
+    let overviewRes, orgRes;
+    try {
+      [overviewRes, orgRes] = await Promise.all([
+        fetchWithTimeout(overviewUrl, { method: "GET", headers: genesysHeaders }),
+        fetchWithTimeout(orgUrl, { method: "GET", headers: genesysHeaders }),
+      ]);
+    } catch (e) {
+      return res.status(504).json({
+        success: false,
+        error: "Timeout al consultar Genesys Cloud. Intente de nuevo.",
+      });
+    }
+
+    if (!overviewRes.ok) {
+      const errorText = await overviewRes.text();
+      let errorJson;
+      try {
+        errorJson = JSON.parse(errorText);
+      } catch (e) {
+        errorJson = { message: errorText };
+      }
+      return res.status(overviewRes.status).json({
+        success: false,
+        error: errorJson.message || "Error al consultar la API de Genesys Cloud",
+        details: errorJson,
+      });
+    }
+
+    const data = await overviewRes.json();
+
+    // Enriquecer con fechas
+    const endDateObj = new Date(timestamp);
+    data.billingPeriodEndDate = endDateObj.toISOString();
+
+    const startDateObj = new Date(timestamp);
+    startDateObj.setUTCMonth(startDateObj.getUTCMonth() - 1);
+    data.billingPeriodStartDate = startDateObj.toISOString();
+
+    data.rampPeriodStartDate = data.rampPeriodStartingTimestamp || data.billingPeriodStartDate;
+    data.rampPeriodEndDate = data.rampPeriodEndingTimestamp || data.billingPeriodEndDate;
+
+    // Enriquecer con datos de organización (ya obtenidos en paralelo)
+    if (!data.organization && orgRes.ok) {
+      try {
+        const orgData = await orgRes.json();
+        data.organization = { name: orgData.name || "", id: orgData.id || "" };
+      } catch (orgError) {
+        console.warn("[subscriptionoverview] No se pudo parsear datos de la organización:", orgError.message);
+      }
+    }
+
+    const customerFormated = formatTrusteeBilling(data);
+
+    console.log("✅ Subscription overview obtenido y formateado correctamente");
+    return res.status(200).json({
+      success: true,
+      data,
+      customer: customerFormated,
+    });
+  } catch (error) {
+    console.error("❌ Error en /api/subscriptionoverview:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Error interno del servidor",
+    });
+  }
+});
+
+// Endpoint para obtener la lista de periodos reales de facturación desde Genesys
+app.post("/api/billing/periods", async (req, res) => {
+  try {
+    const { accessToken, region } = req.body;
+
+    if (!accessToken) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requiere accessToken en el cuerpo de la petición.",
+      });
+    }
+
+    const regionUrl = getRegionUrl(region || "us-east-1");
+    if (!regionUrl || regionUrl === "null") {
+      return res.status(400).json({
+        success: false,
+        error: "Región no válida o no soportada.",
+      });
+    }
+
+    const apiUrl = `${regionUrl}/api/v2/billing/periods`;
+    console.log(`[billing] Consultando periodos de facturación reales: ${apiUrl}`);
+
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorJson;
+      try {
+        errorJson = JSON.parse(errorText);
+      } catch (e) {
+        errorJson = { message: errorText };
+      }
+      return res.status(response.status).json({
+        success: false,
+        error: errorJson.message || "Error al consultar los periodos en Genesys Cloud",
+        details: errorJson,
+      });
+    }
+
+    const data = await response.json();
+    return res.status(200).json({
+      success: true,
+      periods: data.entities || [],
+    });
+  } catch (error) {
+    console.error("❌ Error en /api/billing/periods:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Error interno del servidor",
     });
   }
 });
