@@ -2,6 +2,10 @@ function formatTrusteeBilling(billingData) {
   // Aquí puedes formatear los datos según tus necesidades
 
   const listNameLicences = [
+    "Genesys Cloud CX 4",
+    "Genesys Cloud CX 4 Concurrent",
+    "Genesys Cloud CX 4 Digital User",
+    "Genesys Cloud CX 4 Digital Concurrent User",
     "Genesys Cloud CX 3",
     "Genesys Cloud CX 3 Concurrent",
     "Genesys Cloud CX 3 Digital User",
@@ -238,12 +242,15 @@ function formatTrusteeBilling(billingData) {
     orgId: billingData.organization?.id || "",
     licencias: listLicencesFounded,
     facturacion: {
-      inicio: billingData.billingPeriodStartDate,
-      final: billingData.billingPeriodEndDate,
+      // subscriptionoverview puede usar periodStartDate/periodEndDate
+      // trusteebillingoverview usa billingPeriodStartDate/billingPeriodEndDate
+      inicio: billingData.billingPeriodStartDate || billingData.periodStartDate || billingData.startDate || null,
+      final: billingData.billingPeriodEndDate || billingData.periodEndDate || billingData.endDate || null,
     },
     rampUp: {
-      inicio: billingData.rampPeriodStartDate,
-      final: billingData.rampPeriodEndDate,
+      // rampPeriod puede no existir en subscriptionoverview; usamos la facturación como fallback
+      inicio: billingData.rampPeriodStartDate || billingData.billingPeriodStartDate || billingData.periodStartDate || null,
+      final: billingData.rampPeriodEndDate || billingData.billingPeriodEndDate || billingData.periodEndDate || null,
     },
     storage: {
       comprometido: storage?.prepayQuantity ?? 0,

@@ -50,13 +50,13 @@ function generateNotificationEmailTemplate(templateType, clientData) {
   const tokensPercentage =
     clientData.iaTokens.incluido > 0
       ? Math.round(
-          (clientData.iaTokens.usageQuantity /
-            (clientData.iaTokens.prepayQuantity +
-              clientData.iaTokens.incluido)) *
-            100,
-        )
+        (clientData.iaTokens.usageQuantity /
+          (clientData.iaTokens.prepayQuantity +
+            clientData.iaTokens.incluido)) *
+        100,
+      )
       : 0;
-
+  console.log("CLIENT DATA", clientData);
   const periodStart = formatDate(clientData.facturacion.inicio);
   const periodEnd = formatDate(clientData.facturacion.final);
 
@@ -84,13 +84,13 @@ function generateNotificationEmailTemplate(templateType, clientData) {
     </div>
 
     ${clientData.licencias
-      .map((lic) => {
-        const licUsed = Number(lic?.usageQuantity ?? 0);
-        const licTotal = Number(lic?.prepayQuantity ?? 0);
-        const licPercentage = calculatePercentage(licUsed, licTotal);
-        const licBarColor = getProgressBarColor(licPercentage);
+            .map((lic) => {
+              const licUsed = Number(lic?.usageQuantity ?? 0);
+              const licTotal = Number(lic?.prepayQuantity ?? 0);
+              const licPercentage = calculatePercentage(licUsed, licTotal);
+              const licBarColor = getProgressBarColor(licPercentage);
 
-        return `
+              return `
             <table width="100%" cellpadding="0" cellspacing="0" style="border: 1px solid #e2e8f0; border-radius: 8px; background: #fefefe; margin-bottom: 20px; padding: 20px;">
               <tr>
                 <td style="padding: 20px;">
@@ -108,27 +108,27 @@ function generateNotificationEmailTemplate(templateType, clientData) {
               </tr>
             </table>
             `;
-      })
-      .join("")}
+            })
+            .join("")}
             
             ${[
-              {
-                label: "Storage",
-                used: storageUsed.toLocaleString() + " GB",
-                total: storageTotal.toLocaleString() + " GB",
-                percent: storagePercentage,
-                barColor: getProgressBarColor(storagePercentage),
-              },
-              {
-                label: "IA Tokens",
-                used: tokensUsed.toLocaleString(),
-                total: tokensTotal.toLocaleString(),
-                percent: tokensPercentage,
-                barColor: getProgressBarColor(tokensPercentage),
-              },
-            ]
-              .map(
-                (item) => `
+            {
+              label: "Storage",
+              used: storageUsed.toLocaleString() + " GB",
+              total: storageTotal.toLocaleString() + " GB",
+              percent: storagePercentage,
+              barColor: getProgressBarColor(storagePercentage),
+            },
+            {
+              label: "IA Tokens",
+              used: tokensUsed.toLocaleString(),
+              total: tokensTotal.toLocaleString(),
+              percent: tokensPercentage,
+              barColor: getProgressBarColor(tokensPercentage),
+            },
+          ]
+            .map(
+              (item) => `
         
       <table width="100%" cellpadding="0" cellspacing="0" style="border: 1px solid #e2e8f0; border-radius: 8px; background: #fefefe; margin-bottom: 20px; padding: 20px;">
         <tr>
@@ -147,17 +147,16 @@ function generateNotificationEmailTemplate(templateType, clientData) {
         </tr>
       </table>
     `,
-              )
-              .join("")}
+            )
+            .join("")}
 
-    ${
-      clientData.addons && clientData.addons.length > 0
-        ? `
+    ${clientData.addons && clientData.addons.length > 0
+            ? `
       <div style="background: #f8fafc; border-radius: 8px; padding: 20px; margin-top: 24px;">
         <h3 style="margin: 0 0 16px 0; color: #1e293b; font-size: 18px; font-weight: 600;">Resumen de Add-ons</h3>
         ${clientData.addons
-          .map(
-            (addon) => `
+              .map(
+                (addon) => `
             <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 8px; border-bottom: 1px solid #e2e8f0;">
               <tr>
                 <td align="left" style="font-size: 14px; color: #475569;">${addon.name}:</td>
@@ -165,12 +164,12 @@ function generateNotificationEmailTemplate(templateType, clientData) {
               </tr>
             </table>
           `,
-          )
-          .join("")}
+              )
+              .join("")}
       </div>
     `
-        : ""
-    }
+            : ""
+          }
   </div>
 
   <div style="background: #1e293b; color: white; padding: 24px; text-align: center;">
@@ -212,19 +211,19 @@ function generateNotificationEmailTemplate(templateType, clientData) {
       <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
 
 ${clientData.licencias
-  .map((lic) => {
-    const licUsed = Number(lic?.usageQuantity ?? 0);
-    const licTotal = Number(lic?.prepayQuantity ?? 0);
-    const licPercentage = calculatePercentage(licUsed, licTotal);
-    const barColor = licPercentage > 100 ? "#dc2626" : "#16a34a";
-    return `
+            .map((lic) => {
+              const licUsed = Number(lic?.usageQuantity ?? 0);
+              const licTotal = Number(lic?.prepayQuantity ?? 0);
+              const licPercentage = calculatePercentage(licUsed, licTotal);
+              const barColor = licPercentage > 100 ? "#dc2626" : "#16a34a";
+              return `
                 <tr>
           <td align="left" style="color: #475569; font-size: 14px;">${lic.name}:</td>
           <td align="right" style="color: ${barColor}; font-size: 14px; font-weight: 500;">${licUsed} / ${licTotal} (${licPercentage}%)</td>
         </tr>
               `;
-  })
-  .join("")}
+            })
+            .join("")}
 
 
         <tr>
@@ -242,18 +241,18 @@ ${clientData.licencias
       <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; background: #fefefe; margin-bottom: 20px;">
         <h3 style="margin: 0 0 12px 0; color: #16a34a; font-size: 16px; font-weight: 600;">✅ Licencias Disponibles</h3>
         ${clientData.licencias
-          .map((lic) => {
-            const licUsed = Number(lic?.usageQuantity ?? 0);
-            const licTotal = Number(lic?.prepayQuantity ?? 0);
-            // si licTotal - licUsed < 0
-            const availableLicenses =
-              licTotal - licUsed < 0 ? 0 : licTotal - licUsed;
-            return `
+            .map((lic) => {
+              const licUsed = Number(lic?.usageQuantity ?? 0);
+              const licTotal = Number(lic?.prepayQuantity ?? 0);
+              // si licTotal - licUsed < 0
+              const availableLicenses =
+                licTotal - licUsed < 0 ? 0 : licTotal - licUsed;
+              return `
         
         <p style="margin: 0 0 8px 0; font-size: 14px; color: #333;">${lic.name}: ${availableLicenses} licencias disponibles</p>
         `;
-          })
-          .join("")}
+            })
+            .join("")}
         </div>
 
       <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; background: #fefefe;">
@@ -263,14 +262,13 @@ ${clientData.licencias
       </div>
     </div>
 
-    ${
-      clientData.addons && clientData.addons.length > 0
-        ? `
+    ${clientData.addons && clientData.addons.length > 0
+            ? `
       <div style="background: #f8fafc; border-radius: 8px; padding: 20px; margin-top: 24px;">
         <h3 style="margin: 0 0 16px 0; color: #1e293b; font-size: 18px; font-weight: 600;">Add-ons Utilizados</h3>
         ${clientData.addons
-          .map(
-            (addon) => `
+              .map(
+                (addon) => `
             <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 8px; border-bottom: 1px solid #e2e8f0;">
               <tr>
                 <td align="left" style="color: #475569; font-size: 14px;">${addon.name}</td>
@@ -278,12 +276,12 @@ ${clientData.licencias
               </tr>
             </table>
           `,
-          )
-          .join("")}
+              )
+              .join("")}
       </div>
     `
-        : ""
-    }
+            : ""
+          }
   </div>
 
   <div style="background: #1e293b; color: white; padding: 24px; text-align: center;">
@@ -360,24 +358,24 @@ ${clientData.licencias
               
               <div style="margin-bottom: 32px;">
                       ${clientData.licencias
-                        .filter((lic) => {
-                          const licUsed = Number(lic?.usageQuantity ?? 0);
-                          const licTotal = Number(lic?.prepayQuantity ?? 0);
-                          const licPercentage = calculatePercentage(
-                            licUsed,
-                            licTotal,
-                          );
-                          return licPercentage >= 90;
-                        })
-                        .map((lic) => {
-                          const licUsed = Number(lic?.usageQuantity ?? 0);
-                          const licTotal = Number(lic?.prepayQuantity ?? 0);
-                          const licPercentage = calculatePercentage(
-                            licUsed,
-                            licTotal,
-                          );
+            .filter((lic) => {
+              const licUsed = Number(lic?.usageQuantity ?? 0);
+              const licTotal = Number(lic?.prepayQuantity ?? 0);
+              const licPercentage = calculatePercentage(
+                licUsed,
+                licTotal,
+              );
+              return licPercentage >= 90;
+            })
+            .map((lic) => {
+              const licUsed = Number(lic?.usageQuantity ?? 0);
+              const licTotal = Number(lic?.prepayQuantity ?? 0);
+              const licPercentage = calculatePercentage(
+                licUsed,
+                licTotal,
+              );
 
-                          return `
+              return `
                             <div style="border: 1px solid #dc2626; border-radius: 8px; padding: 20px; background: #fef2f2; margin-bottom: 20px;">
                               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                                 <span style="font-size: 14px; font-weight: 600; color: #dc2626;">🔴 ${lic.name} - CRÍTICO</span>
@@ -389,28 +387,28 @@ ${clientData.licencias
                               <div style="font-size: 12px; color: #dc2626; font-weight: 600; text-align: right;"> ${Number.isFinite(licPercentage) ? licPercentage : 0}% utilizado - SOBREUSO INMINENTE</div>
                             </div>
                           `;
-                        })
-                        .join("")}
+            })
+            .join("")}
  
             ${(clientData.addons || [])
-              .filter((addon) => {
-                const addonUsed = Number(addon?.usageQuantity ?? 0);
-                const addonTotal = Number(addon?.prepayQuantity ?? 0);
-                const addonPercentage = calculatePercentage(
-                  addonUsed,
-                  addonTotal,
-                );
-                return addonPercentage >= 90;
-              })
-              .map((addon) => {
-                const addonUsed = Number(addon?.usageQuantity ?? 0);
-                const addonTotal = Number(addon?.prepayQuantity ?? 0);
-                const addonPercentage = calculatePercentage(
-                  addonUsed,
-                  addonTotal,
-                );
+            .filter((addon) => {
+              const addonUsed = Number(addon?.usageQuantity ?? 0);
+              const addonTotal = Number(addon?.prepayQuantity ?? 0);
+              const addonPercentage = calculatePercentage(
+                addonUsed,
+                addonTotal,
+              );
+              return addonPercentage >= 90;
+            })
+            .map((addon) => {
+              const addonUsed = Number(addon?.usageQuantity ?? 0);
+              const addonTotal = Number(addon?.prepayQuantity ?? 0);
+              const addonPercentage = calculatePercentage(
+                addonUsed,
+                addonTotal,
+              );
 
-                return `
+              return `
                               <div style="border: 1px solid #dc2626; border-radius: 8px; padding: 20px; background: #fef2f2; margin-bottom: 20px;">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                                   <span style="font-size: 14px; font-weight: 600; color: #dc2626;">🔴 ${addon.name} - CRÍTICO</span>
@@ -422,12 +420,11 @@ ${clientData.licencias
                                 <div style="font-size: 12px; color: #dc2626; font-weight: 600; text-align: right;"> ${Number.isFinite(addonPercentage) ? addonPercentage : 0}% utilizado - SOBREUSO INMINENTE</div>
                               </div>
                             `;
-              })
-              .join("")}
+            })
+            .join("")}
                         
-                      ${
-                        storagePercentage >= 90
-                          ? `
+                      ${storagePercentage >= 90
+            ? `
                               <div style="border: 1px solid #dc2626; border-radius: 8px; padding: 20px; background: #fef2f2; margin-bottom: 20px;">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                                   <span style="font-size: 14px; font-weight: 600; color: #dc2626;">🔴 Storage - CRÍTICO</span>
@@ -439,12 +436,11 @@ ${clientData.licencias
                                 <div style="font-size: 12px; color: #dc2626; font-weight: 600; text-align: right;"> ${Number.isFinite(storagePercentage) ? storagePercentage : 0}% utilizado - SOBREUSO INMINENTE</div>
                               </div>
                             `
-                          : ""
-                      }
+            : ""
+          }
                       
-                      ${
-                        tokensPercentage >= 90
-                          ? `
+                      ${tokensPercentage >= 90
+            ? `
                               <div style="border: 1px solid #dc2626; border-radius: 8px; padding: 20px; background: #fef2f2; margin-bottom: 20px;">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
                                   <span style="font-size: 14px; font-weight: 600; color: #dc2626;">🔴 IA Tokens - CRÍTICO</span>
@@ -456,8 +452,8 @@ ${clientData.licencias
                                 <div style="font-size: 12px; color: #dc2626; font-weight: 600; text-align: right;"> ${Number.isFinite(tokensPercentage) ? tokensPercentage : 0}% utilizado - SOBREUSO INMINENTE</div>
                               </div>
                             `
-                          : ""
-                      }
+            : ""
+          }
               </div>
               
               <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 20px; margin-top: 24px;">
@@ -606,22 +602,20 @@ function generateTemplate(templateType, data) {
                     <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.usuario}</span>
                   </div>
                   
-                  ${
-                    isPasswordUpdate
-                      ? `<div style="display: flex; padding: 10px 0; border-top: 1px solid #dbeafe;">
+                  ${isPasswordUpdate
+            ? `<div style="display: flex; padding: 10px 0; border-top: 1px solid #dbeafe;">
                         <p style="margin: 0; color: #dc2626; font-size: 14px; font-weight: 600;">* NOTA: Tu contraseña fue modificada.</p>
                     </div>`
-                      : ""
-                  }
+            : ""
+          }
 
-                  ${
-                    data.role
-                      ? `<div style="display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid #dbeafe;">
+                  ${data.role
+            ? `<div style="display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid #dbeafe;">
                                 <span style="color: #475569; font-size: 14px; font-weight: 500;">Rol Actual: </span>
                                 <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.role}</span>
                             </div>`
-                      : ""
-                  }
+            : ""
+          }
                        
                 </div>
                 
