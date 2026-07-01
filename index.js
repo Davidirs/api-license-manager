@@ -166,11 +166,11 @@ app.post("/api/login", async (req, res) => {
 
     let tokens;
 
+    // Obtener la colección credenciales
+    const credsSnapshot = await db.collection("credentials").get();
+    const regionEnvMap = credsSnapshot.docs.map((doc) => doc.data());
 
     if (userFound.role === "administrator") {
-      // Obtener la colección credenciales
-      const credsSnapshot = await db.collection("credentials").get();
-      const regionEnvMap = credsSnapshot.docs.map((doc) => doc.data());
       console.log(
         "🔑 Obteniendo tokens para administrador de todas las regiones",
       );
