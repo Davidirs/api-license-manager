@@ -1999,6 +1999,83 @@ ${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
   }
 });
 
+// Endpoint para analizar comparativa entre periodos con IA
+app.post("/api/analyze-comparison", async (req, res) => {
+  try {
+    const { kpiData, selectedCategories, kpiName, languageName } = req.body;
+
+    const groqApiKey = process.env.GROQ_API_KEY;
+    if (!groqApiKey) {
+      return res.status(500).json({
+        success: false,
+        error: "GROQ_API_KEY no está configurado en el servidor."
+      });
+    }
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX especializado en análisis comparativo entre periodos de facturación. Analiza los datos proporcionados y genera un análisis detallado en ${languageName || 'español'}.
+
+REGLAS DE FORMATO OBLIGATORIAS:
+1. No uses negritas (**texto**) en ningún lugar.
+2. Para listas usa "1.- " para números o "- " para viñetas.
+3. Estructura tu respuesta en secciones claras.
+
+Para cada KPI analizado, debes:
+1. Comparar los valores entre periodos (incremento/decremento porcentual)
+2. Identificar tendencias (creciente, decreciente, estable)
+3. Proporcionar contexto sobre si los cambios son normales o requieren atención
+4. Dar recomendaciones específicas basadas en las tendencias observadas`;
+
+    const userPrompt = `Analiza la siguiente comparativa de métricas de Genesys Cloud entre periodos de facturación:
+
+Categorías seleccionadas: ${selectedCategories.join(", ")}
+
+Datos de KPIs por periodo:
+${JSON.stringify(kpiData, null, 2)}
+
+${kpiName ? `Enfócate especialmente en el KPI: "${kpiName}"` : "Proporciona un análisis general de todos los KPIs."}
+
+Para cada KPI, incluye:
+- Comparación numérica entre periodos
+- Variación porcentual
+- Tendencia
+- Recomendaciones`;
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqApiKey}`
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 2000
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Groq API error: ${response.status} - ${errText}`);
+    }
+
+    const data = await response.json();
+    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+
+    return res.status(200).json({
+      success: true,
+      analysis: aiText
+    });
+
+  } catch (error) {
+    console.error("Error en analyze-comparison:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Endpoint: Intentos Outbound y métricas de campañas
 app.get("/api/reports/outbound-attempts", async (req, res) => {
   res.set('Cache-Control', 'no-store');
