@@ -2534,6 +2534,160 @@ app.post("/api/sendmail", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Endpoint: BYOC Voice – Consumo desglosado por División
+// Consulta la API de Agregados de Conversación de Genesys Cloud
+// POST /api/v2/analytics/conversations/aggregates/query
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/reports/byoc-voice-divisions", async (req, res) => {
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    const url = getRegionUrl(region);
+
+    // ── Timezone offset ───────────────────────────────────────────────────
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const fmtStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStart = fmtStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStart.replace("GMT", "") || "Z";
+
+        const fmtEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzEnd = fmtEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzEnd.replace("GMT", "") || "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset:", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    console.log(`📞 [byoc-voice-divisions] interval=${interval}  region=${region}`);
+
+    // ── Get Divisions to map IDs to Names ─────────────────────────────────
+    const divisionsObj = await getDivisions(accessToken, region, false);
+    const divisionsMap = {};
+    divisionsObj.forEach(div => { divisionsMap[div.id] = div.name; });
+
+    // ── Query Conversations Aggregates by division (voice only) ───────────
+    const payload = {
+      interval: interval,
+      groupBy: ["divisionId"],
+      metrics: [
+        "nOffered",    // Llamadas entrantes offered
+        "tAnswered",   // Tiempo contestado (ms)
+        "tTalk",       // Tiempo de conversación (ms)
+        "nConnected"   // Llamadas conectadas
+      ],
+      filter: {
+        type: "and",
+        predicates: [
+          {
+            type: "dimension",
+            dimension: "mediaType",
+            value: "voice"
+          }
+        ]
+      }
+    };
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`
+    };
+
+    const apiResponse = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(payload)
+    });
+
+    if (!apiResponse.ok) {
+      const errorText = await apiResponse.text();
+      console.error(`❌ [byoc-voice-divisions] API error ${apiResponse.status}:`, errorText);
+      return res.status(apiResponse.status).json({
+        success: false,
+        error: `Error de la API de Genesys Cloud: ${apiResponse.status}`
+      });
+    }
+
+    const apiData = await apiResponse.json();
+
+    // ── Build division results ────────────────────────────────────────────
+    const divisionResults = [];
+
+    if (apiData.results && apiData.results.length > 0) {
+      apiData.results.forEach(group => {
+        const divId = group.group?.divisionId || "Home";
+        const divisionName = divisionsMap[divId] || (divId === "Home" ? "Home / Default" : divId);
+
+        let nOffered = 0;
+        let tAnswered = 0;
+        let tTalk = 0;
+        let nConnected = 0;
+
+        if (group.data && group.data[0] && group.data[0].metrics) {
+          group.data[0].metrics.forEach(m => {
+            switch (m.metric) {
+              case "nOffered":
+                nOffered = m.stats.count || 0;
+                break;
+              case "tAnswered":
+                tAnswered = (m.stats.sum || 0) / 1000; // ms to seconds
+                break;
+              case "tTalk":
+                tTalk = (m.stats.sum || 0) / 1000; // ms to seconds
+                break;
+              case "nConnected":
+                nConnected = m.stats.count || 0;
+                break;
+            }
+          });
+        }
+
+        divisionResults.push({
+          divisionId: divId,
+          divisionName,
+          nOffered,
+          tAnswered,
+          tTalk,
+          nConnected
+        });
+      });
+    }
+
+    // Sort by nOffered descending
+    divisionResults.sort((a, b) => b.nOffered - a.nOffered);
+
+    console.log(`✅ [byoc-voice-divisions] ${divisionResults.length} divisiones encontradas`);
+
+    return res.status(200).json({
+      success: true,
+      data: divisionResults,
+      interval
+    });
+
+  } catch (error) {
+    console.error("Error en byoc-voice-divisions:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Error interno del servidor"
+    });
+  }
+});
+
 // Endpoint de prueba para guardar algo en Firestore
 app.post("/api/firestore-test", async (req, res) => {
   try {
