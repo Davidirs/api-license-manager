@@ -15,8 +15,9 @@
     "express": "^4.19.2",
     "firebase-admin": "^13.8.0",
     "ioredis": "^5.10.1",
+    "jsonwebtoken": "^9.0.3",
     "node-cron": "^4.2.1",
-    "purecloud-platform-client-v2": "^255.1.0",
-    "resend": "^6.12.2"
+    "nodemailer": "^9.0.3",
+    "purecloud-platform-client-v2": "^255.1.0"
   }
 }
