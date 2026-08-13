@@ -13,9 +13,12 @@ const cron = require("node-cron");
 const { db } = require("../firebase");
 const { enqueueOrgMonitor } = require("./monitorQueue");
 const { isKnownRegion } = require("../utils/genesysRegions");
+const { purgeOldLogs } = require("../utils/auditLog");
 
 const PAGE_SIZE = Number(process.env.MONITOR_FIRESTORE_PAGE_SIZE) || 500;
 const CRON_EXPRESSION = process.env.MONITOR_CRON || "0 * * * *";
+// Purga del log de accesos: una vez al día, de madrugada.
+const LOG_PURGE_CRON = process.env.LOG_PURGE_CRON || "30 3 * * *";
 
 /**
  * Una organización o un usuario se consideran activos salvo que `active` sea
@@ -37,6 +40,8 @@ function compactUser(user) {
       notificationDays: user.preferences?.notificationDays || [],
       notificationTime: user.preferences?.notificationTime || "08:00",
       timezone: user.preferences?.timezone || "UTC",
+      // Idioma en el que se le renderizan las plantillas de correo.
+      language: user.preferences?.language || null,
     },
   };
 }
@@ -240,6 +245,14 @@ function initCron() {
     );
   });
   console.log(`🕰️ [Cron] Orquestador inicializado con la expresión "${CRON_EXPRESSION}".`);
+
+  // Purga diaria del log de accesos: sin ella la colección crece sin techo.
+  cron.schedule(LOG_PURGE_CRON, () => {
+    purgeOldLogs().catch((err) =>
+      console.error("❌ [Cron] Purga de logs falló:", err.message),
+    );
+  });
+  console.log(`🧹 [Cron] Purga de logs programada con la expresión "${LOG_PURGE_CRON}".`);
 }
 
 module.exports = {

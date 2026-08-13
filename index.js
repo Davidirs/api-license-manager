@@ -39,12 +39,34 @@ app.use(
       }
       if (allowedOrigins.includes(origin)) return callback(null, true);
       console.warn(`⛔ [CORS] Origen bloqueado: ${origin}`);
-      return callback(new Error("Origen no permitido por CORS"));
+      const error = new Error("Origen no permitido por CORS");
+      error.code = "CORS_NOT_ALLOWED";
+      return callback(error);
     },
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization", "x-admin-token", "x-genesys-token"],
   }),
 );
+
+/**
+ * Respuesta limpia para los orígenes bloqueados.
+ *
+ * Sin esto, el error del middleware de CORS llega al manejador por defecto de
+ * Express, que devuelve una página HTML con la traza completa y las rutas
+ * absolutas del servidor. Va aquí, inmediatamente después de `cors`, para no
+ * interferir con el resto de errores de la aplicación.
+ */
+app.use((err, req, res, next) => {
+  if (err && err.code === "CORS_NOT_ALLOWED") {
+    return res.status(403).json({
+      success: false,
+      code: "CORS_NOT_ALLOWED",
+      message: "Origen no permitido.",
+    });
+  }
+  return next(err);
+});
+
 app.use(express.json());
 
 // Health check público, útil para el balanceador y para diagnosticar la config.
@@ -80,6 +102,20 @@ const {
 // Envío de correo por SMTP (IONOS). Sustituye a Resend.
 const { sendMail, verifyTransport, smtpConfig } = require("./utils/mailer");
 const { fetchOrgToken } = require("./utils/genesysRegions");
+// Registro de conexión y acceso (colección Firestore `accessLogs`).
+const {
+  EVENT,
+  logEvent,
+  queryLogs,
+  purgeOldLogs,
+  RETENTION_DAYS: LOG_RETENTION_DAYS,
+} = require("./utils/auditLog");
+// Bloqueo de notificaciones por entorno (ENTORNO=STAGING).
+const { notificationsBlocked, blockedReason, currentEnv } = require("./utils/environment");
+// Idioma de las plantillas de correo y del análisis de la IA.
+const { normalizeLanguage, SUPPORTED_LANGUAGES } = require("./utils/emailI18n");
+const { promptsFor, languageRule, numbered } = require("./utils/aiPrompts");
+const { languageForRecipients, forgetRecipient } = require("./utils/userLanguage");
 
 /**
  * Guard para endpoints administrativos que pueden disparar envíos masivos.
@@ -108,6 +144,17 @@ function requireAdminToken(req, res) {
   }
 
   return true;
+}
+
+/**
+ * Devuelve las preferencias con `language` saneado a uno de los idiomas
+ * soportados (es | en | pt). Un valor inesperado llegado del front no debe
+ * quedar guardado: se caería a español en cada correo sin que nadie lo note.
+ */
+function withNormalizedLanguage(preferences) {
+  const prefs = preferences && typeof preferences === "object" ? { ...preferences } : {};
+  prefs.language = normalizeLanguage(prefs.language);
+  return prefs;
 }
 
 // Helper para obtener token internamente.
@@ -143,6 +190,14 @@ app.post("/api/login", async (req, res) => {
     const userDoc = await db.collection("users").doc(cleanUsername).get();
 
     if (!userDoc.exists) {
+      logEvent({
+        type: EVENT.LOGIN_USER_NOT_FOUND,
+        req,
+        username: cleanUsername,
+        orgname,
+        success: false,
+        message: "Usuario no encontrado.",
+      });
       return res
         .status(401)
         .json({ success: false, message: "Usuario no encontrado." });
@@ -157,6 +212,15 @@ app.post("/api/login", async (req, res) => {
     // Los usuarios legados sin el campo 'active' se consideran activos.
     if (userFound.active === false) {
       console.warn(`🚫 [Usuario desactivado] username="${cleanUsername}"`);
+      logEvent({
+        type: EVENT.LOGIN_USER_DISABLED,
+        req,
+        username: cleanUsername,
+        orgname,
+        role: userFound.role,
+        success: false,
+        message: "El usuario está desactivado.",
+      });
       return res.status(403).json({
         success: false,
         code: "USER_DISABLED",
@@ -227,6 +291,16 @@ app.post("/api/login", async (req, res) => {
         console.error(
           `❌ [Acceso denegado] username="${cleanUsername}" | role="${userFound.role}" | orgname_usuario="${userFound.orgname}" | orgname_solicitada="${orgname}" | thrusted="${userFound.thrusted}"`,
         );
+        logEvent({
+          type: EVENT.LOGIN_NO_ACCESS,
+          req,
+          username: cleanUsername,
+          orgname,
+          role: userFound.role,
+          success: false,
+          message: "El usuario no pertenece a la organización solicitada.",
+          detail: { orgnameUsuario: userFound.orgname },
+        });
         return res.status(401).json({
           success: false,
           message:
@@ -253,6 +327,16 @@ app.post("/api/login", async (req, res) => {
         orgActiveSnapshot.docs[0].data().active === false
       ) {
         console.warn(`🚫 [Organización desactivada] orgname="${orgname}"`);
+        logEvent({
+          type: EVENT.LOGIN_ORG_DISABLED,
+          req,
+          username: cleanUsername,
+          orgname,
+          orgId: orgActiveSnapshot.docs[0].id,
+          role: userFound.role,
+          success: false,
+          message: "La organización está desactivada.",
+        });
         return res.status(403).json({
           success: false,
           code: "ORG_DISABLED",
@@ -269,6 +353,15 @@ app.post("/api/login", async (req, res) => {
     );
     if (!passwordMatch) {
       console.error(`❌ [Contraseña incorrecta] username="${cleanUsername}"`);
+      logEvent({
+        type: EVENT.LOGIN_FAILED,
+        req,
+        username: cleanUsername,
+        orgname,
+        role: userFound.role,
+        success: false,
+        message: "Contraseña incorrecta.",
+      });
       return res
         .status(401)
         .json({ success: false, message: "Contraseña incorrecta." });
@@ -404,6 +497,18 @@ app.post("/api/login", async (req, res) => {
       orgId: userResponse.orgId,
     });
 
+    logEvent({
+      type: EVENT.LOGIN_SUCCESS,
+      req,
+      username: cleanUsername,
+      orgname: userResponse.orgname || userFound.orgname,
+      orgId: userResponse.orgId,
+      role: userFound.role,
+      success: true,
+      message: "Inicio de sesión correcto.",
+      detail: { language: userFound.preferences?.language || null },
+    });
+
     return res.status(200).json({
       success: true,
       message: "Login exitoso",
@@ -413,12 +518,34 @@ app.post("/api/login", async (req, res) => {
     });
   } catch (error) {
     console.error("Login error:", error);
+    logEvent({
+      type: EVENT.LOGIN_ERROR,
+      req,
+      username: req.body?.username,
+      orgname: req.body?.orgname,
+      success: false,
+      message: error.message,
+    });
     return res.status(500).json({
       success: false,
       message: "Error interno del servidor.",
       details: error.message,
     });
   }
+});
+
+/**
+ * Cierre de sesión. No invalida el JWT (es sin estado y de vida corta): existe
+ * para dejar constancia en el log de cuándo terminó cada sesión.
+ */
+app.post("/api/logout", (req, res) => {
+  logEvent({
+    type: EVENT.LOGOUT,
+    req,
+    success: true,
+    message: "Cierre de sesión.",
+  });
+  return res.status(200).json({ success: true, message: "Sesión cerrada." });
 });
 
 app.post("/api/token", requireAdmin, async (req, res) => {
@@ -527,6 +654,12 @@ app.post("/api/monitor/run", async (req, res) => {
   if (!requireAdminToken(req, res)) return;
 
   console.log("▶️ Forzando ejecución del monitor desde endpoint administrativo...");
+  logEvent({
+    type: EVENT.MONITOR_RUN,
+    req,
+    message: "Ejecución manual del orquestador de monitoreo.",
+    detail: { entorno: currentEnv(), notificacionesBloqueadas: notificationsBlocked() },
+  });
   runDailyMonitor().catch((err) =>
     console.error("❌ Ejecución manual del monitor falló:", err.message),
   );
@@ -1864,7 +1997,7 @@ app.get("/api/reports/ia-tokens-daily", async (req, res) => {
 // Endpoint para analizar métricas con IA (usando Groq API y API Key del Servidor)
 app.post("/api/analyze-metrics", async (req, res) => {
   try {
-    const { clientData, dailyLogins, outboundAttempts, overageDetailsText, languageName } = req.body;
+    const { clientData, dailyLogins, outboundAttempts, overageDetailsText, lang, languageName } = req.body;
 
     const groqApiKey = process.env.GROQ_API_KEY;
 
@@ -1875,31 +2008,42 @@ app.post("/api/analyze-metrics", async (req, res) => {
       });
     }
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas en ${languageName || 'español'}. 
+    // El idioma se resuelve en el backend, no se toma tal cual del cliente:
+    // antes llegaba una cadena libre y bastaba una clave de traducción sin
+    // traducir para que el modelo recibiera un idioma inexistente y respondiera
+    // en cualquier lengua. `promptsFor`/`languageRule` sanean el valor y caen a
+    // español ante cualquier cosa que no reconozcan.
+    const idiomaAnalisis = lang || languageName;
+    const p = promptsFor(idiomaAnalisis);
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas.
+
+${languageRule(idiomaAnalisis)}
 
 REGLAS DE FORMATO OBLIGATORIAS:
 1. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto del análisis.
 2. Para las listas y puntos, utiliza "1.- " para números o "- " para viñetas, nunca uses "*".
 3. En la sección de Recomendaciones, debes sugerir explícitamente que a través de la opción de "Último Login" (en Conexiones Diarias) el administrador puede detectar usuarios inactivos que no han iniciado sesión en los últimos meses. Recomienda desactivar estas cuentas en la organización de Genesys Cloud para evitar que por algún motivo inicien sesión por error y consuman licencias innecesarias de la organización.
-4. Si se proporciona información de sobreuso de licencias y el detalle de los últimos usuarios que iniciaron sesión, menciónalos en el análisis indicando quiénes fueron los últimos usuarios que registraron actividad y causaron el sobreuso.`;
+4. Si se proporciona información de sobreuso de licencias, analízala indicando en qué licencias se excedió el compromiso y en cuánto, y qué implica ese exceso.
+5. Los datos que recibes son agregados y NO incluyen identidades de agentes. No inventes ni menciones nombres, correos, divisiones ni fechas de inicio de sesión de personas concretas: si el análisis requiere ese detalle, remite al reporte de "Último Login" del panel.`;
 
-    const userPrompt = `Analiza las siguientes métricas de Genesys Cloud y proporciona:
-1. Resumen ejecutivo de uso
-2. Estado de KPIs principales (licencias, recursos, storage, IA tokens y Outbound attempts)
-3. Alertas (si hay sobre-uso)
-4. Recomendaciones específicas para optimización
+    // Los encabezados van ya en el idioma de salida: si se piden en español, el
+    // modelo los copia literalmente y devuelve títulos en español dentro de un
+    // análisis en otro idioma.
+    const userPrompt = `${p.metricsIntro}
+${numbered(p.metricsSections)}
 
-Datos de licencias y uso general:
+${p.metricsLicenses}
 ${JSON.stringify(clientData, null, 2)}
 
-Resumen de conexiones diarias:
+${p.metricsLogins}
 ${JSON.stringify(dailyLogins, null, 2)}
 
-Resumen de intentos outbound y campañas:
+${p.metricsOutbound}
 ${JSON.stringify(outboundAttempts, null, 2)}
 
-Detalles de sobreuso y últimos inicios de sesión:
-${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
+${p.metricsOverage}
+${overageDetailsText || p.metricsNoOverage}`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -1924,7 +2068,14 @@ ${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
     }
 
     const data = await response.json();
-    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+    // Si el modelo no devuelve nada se responde con un código, no con un texto:
+    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
+    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
+    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
+    const aiText = data.choices[0]?.message?.content;
+    if (!aiText) {
+      return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
+    }
 
     return res.status(200).json({
       success: true,
@@ -1940,7 +2091,7 @@ ${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
 // Endpoint para analizar comparativa entre periodos con IA
 app.post("/api/analyze-comparison", async (req, res) => {
   try {
-    const { kpiData, selectedCategories, kpiName, languageName } = req.body;
+    const { kpiData, selectedCategories, kpiName, lang, languageName } = req.body;
 
     const groqApiKey = process.env.GROQ_API_KEY;
     if (!groqApiKey) {
@@ -1950,7 +2101,12 @@ app.post("/api/analyze-comparison", async (req, res) => {
       });
     }
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX especializado en análisis comparativo entre periodos de facturación. Analiza los datos proporcionados y genera un análisis detallado en ${languageName || 'español'}.
+    const idiomaAnalisis = lang || languageName;
+    const p = promptsFor(idiomaAnalisis);
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX especializado en análisis comparativo entre periodos de facturación. Analiza los datos proporcionados y genera un análisis detallado.
+
+${languageRule(idiomaAnalisis)}
 
 REGLAS DE FORMATO OBLIGATORIAS:
 1. No uses negritas (**texto**) en ningún lugar.
@@ -1963,20 +2119,17 @@ Para cada KPI analizado, debes:
 3. Proporcionar contexto sobre si los cambios son normales o requieren atención
 4. Dar recomendaciones específicas basadas en las tendencias observadas`;
 
-    const userPrompt = `Analiza la siguiente comparativa de métricas de Genesys Cloud entre periodos de facturación:
+    const userPrompt = `${p.comparisonIntro}
 
-Categorías seleccionadas: ${selectedCategories.join(", ")}
+${p.comparisonCategories} ${(selectedCategories || []).join(", ")}
 
-Datos de KPIs por periodo:
+${p.comparisonData}
 ${JSON.stringify(kpiData, null, 2)}
 
-${kpiName ? `Enfócate especialmente en el KPI: "${kpiName}"` : "Proporciona un análisis general de todos los KPIs."}
+${kpiName ? p.comparisonFocus.replace("{{kpi}}", kpiName) : p.comparisonGeneral}
 
-Para cada KPI, incluye:
-- Comparación numérica entre periodos
-- Variación porcentual
-- Tendencia
-- Recomendaciones`;
+${p.comparisonEach}
+${p.comparisonSections.map((s) => `- ${s}`).join("\n")}`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -2001,7 +2154,14 @@ Para cada KPI, incluye:
     }
 
     const data = await response.json();
-    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+    // Si el modelo no devuelve nada se responde con un código, no con un texto:
+    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
+    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
+    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
+    const aiText = data.choices[0]?.message?.content;
+    if (!aiText) {
+      return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
+    }
 
     return res.status(200).json({
       success: true,
@@ -2361,11 +2521,28 @@ app.post("/api/setuser", async (req, res) => {
         clientId: userToCreate.clientId || body.clientId || (orgDoc.exists ? orgDoc.data().clientId : "") || "",
         clientSecret: userToCreate.clientSecret || body.clientSecret || (orgDoc.exists ? orgDoc.data().clientSecret : "") || "",
         region: userToCreate.region || body.region || (orgDoc.exists ? orgDoc.data().region : "us-east-1") || "us-east-1",
-        preferences: userToCreate.preferences || {},
+        // El idioma se elige al crear el usuario y decide en qué idioma se le
+        // renderizan la interfaz y las plantillas de correo. Sin selección,
+        // español.
+        preferences: withNormalizedLanguage(userToCreate.preferences),
         // Los usuarios nuevos se crean activos por defecto.
         active: true,
       };
       await userRef.set(firestoreUser);
+      forgetRecipient(cleanUsername);
+
+      logEvent({
+        type: EVENT.USER_CREATED,
+        req,
+        target: cleanUsername,
+        orgname,
+        orgId,
+        message: `Usuario "${cleanUsername}" creado.`,
+        detail: {
+          rol: firestoreUser.role,
+          idioma: firestoreUser.preferences.language,
+        },
+      });
 
       return res.status(201).json({
         success: true,
@@ -2388,6 +2565,9 @@ app.post("/api/setuser", async (req, res) => {
         } = userToCreate;
 
         updates = { ...safeUserFields, orgname };
+        if (safeUserFields.preferences && typeof safeUserFields.preferences === "object") {
+          updates.preferences = withNormalizedLanguage(safeUserFields.preferences);
+        }
         if (orgId) {
           updates.orgId = orgId;
         }
@@ -2398,7 +2578,7 @@ app.post("/api/setuser", async (req, res) => {
         // o reactivarse tras ser dado de baja.
         updates = {};
         if (userToCreate.preferences && typeof userToCreate.preferences === "object") {
-          updates.preferences = userToCreate.preferences;
+          updates.preferences = withNormalizedLanguage(userToCreate.preferences);
         }
       }
 
@@ -2416,6 +2596,27 @@ app.post("/api/setuser", async (req, res) => {
       }
 
       await userRef.set(updates, { merge: true });
+      // La caché de idiomas quedaría sirviendo el anterior hasta que expire.
+      forgetRecipient(cleanUsername);
+
+      logEvent({
+        type: EVENT.USER_UPDATED,
+        req,
+        target: cleanUsername,
+        orgname,
+        orgId,
+        message: isSelf
+          ? "Actualización del propio perfil."
+          : `El administrador actualizó a "${cleanUsername}".`,
+        detail: {
+          // Nunca el valor, sólo qué se tocó: el hash de la contraseña no debe
+          // acabar en un log que se muestra en pantalla.
+          campos: Object.keys(updates)
+            .map((k) => (k === "passwordHash" ? "contraseña" : k))
+            .join(", "),
+          idioma: updates.preferences?.language || null,
+        },
+      });
 
       return res
         .status(200)
@@ -2471,6 +2672,16 @@ app.post("/api/organization", requireAdmin, async (req, res) => {
       { merge: true },
     );
 
+    logEvent({
+      type: orgDoc.exists ? EVENT.ORG_UPDATED : EVENT.ORG_CREATED,
+      req,
+      target: cleanOrgId,
+      orgname: orgname.trim(),
+      orgId: cleanOrgId,
+      message: `Organización "${orgname.trim()}" ${orgDoc.exists ? "actualizada" : "creada"}.`,
+      detail: { region: region || "us-east-1", thrusted: thrusted || "N/A", active: resolvedActive },
+    });
+
     return res.status(200).json({
       success: true,
       message: `Organización ${orgname} guardada exitosamente.`,
@@ -2513,6 +2724,16 @@ app.post("/api/organization/status", requireAdmin, async (req, res) => {
     console.log(
       `🔁 [Org ${active ? "activada" : "desactivada"}] orgId="${orgId}"`,
     );
+
+    logEvent({
+      type: EVENT.ORG_STATUS_CHANGED,
+      req,
+      target: orgId.trim(),
+      orgname: orgDoc.data().orgname || null,
+      orgId: orgId.trim(),
+      message: `Organización ${active ? "activada" : "desactivada"}.`,
+      detail: { active },
+    });
 
     return res.status(200).json({
       success: true,
@@ -2557,6 +2778,16 @@ app.post("/api/user/status", requireAdmin, async (req, res) => {
       `🔁 [Usuario ${active ? "activado" : "desactivado"}] username="${username}"`,
     );
 
+    logEvent({
+      type: EVENT.USER_STATUS_CHANGED,
+      req,
+      target: username.trim(),
+      orgname: userDoc.data().orgname || null,
+      orgId: userDoc.data().orgId || null,
+      message: `Usuario ${active ? "activado" : "desactivado"}.`,
+      detail: { active },
+    });
+
     return res.status(200).json({
       success: true,
       active,
@@ -2569,6 +2800,67 @@ app.post("/api/user/status", requireAdmin, async (req, res) => {
       message: "Error interno del servidor",
       detail: error.message,
     });
+  }
+});
+
+// ==================== Logs de conexión y acceso (admin) ====================
+// Los registros los escribe utils/auditLog.js desde el login, el middleware de
+// sesión y cada acción sensible. Aquí sólo se consultan.
+
+app.get("/api/logs", requireAdmin, async (req, res) => {
+  try {
+    const { from, to, type, category, username, orgname, success, limit, cursor } =
+      req.query;
+
+    const parseTimestamp = (value, endOfDay = false) => {
+      if (!value) return null;
+      // Se aceptan epoch en milisegundos y fechas ISO ("2026-08-12").
+      if (/^\d+$/.test(String(value))) return Number(value);
+      const date = new Date(String(value));
+      if (Number.isNaN(date.getTime())) return null;
+      if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
+        date.setUTCHours(23, 59, 59, 999);
+      }
+      return date.getTime();
+    };
+
+    const result = await queryLogs({
+      from: parseTimestamp(from),
+      to: parseTimestamp(to, true),
+      type: type || null,
+      category: category || null,
+      username: username || null,
+      orgname: orgname || null,
+      success: success === undefined || success === "" ? null : success === "true",
+      limit: limit,
+      cursor: cursor || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      items: result.items,
+      nextCursor: result.nextCursor,
+      retentionDays: LOG_RETENTION_DAYS,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/logs:", error);
+    return res.status(500).json({
+      success: false,
+      message: "No se pudieron consultar los registros.",
+      detail: error.message,
+    });
+  }
+});
+
+// Purga manual de registros antiguos. El cron diario ya la ejecuta sola.
+app.post("/api/logs/purge", requireAdmin, async (req, res) => {
+  try {
+    const days = Number(req.body?.retentionDays) || LOG_RETENTION_DAYS;
+    const result = await purgeOldLogs(days);
+    return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    console.error("❌ Error en POST /api/logs/purge:", error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -2608,6 +2900,13 @@ app.post("/api/settings/email", requireAdmin, async (req, res) => {
     });
 
     console.log(`💾 [Settings] Remitente de correo actualizado: ${settings.from}`);
+    logEvent({
+      type: EVENT.EMAIL_SETTINGS_UPDATED,
+      req,
+      target: "settings/email",
+      message: "Configuración de correo actualizada.",
+      detail: { remitente: settings.from, habilitado: settings.enabled },
+    });
     return res.status(200).json({
       success: true,
       message: "Configuración de correo guardada exitosamente.",
@@ -2743,6 +3042,14 @@ app.post("/api/integrations/whaibot", requireAdmin, async (req, res) => {
       );
 
     console.log("💾 [Integración WhaiBot] configuración guardada");
+    // El apiKey no viaja al log: sanitizeDetail lo descartaría igualmente.
+    logEvent({
+      type: EVENT.INTEGRATION_UPDATED,
+      req,
+      target: "whaibot",
+      message: "Configuración de la integración WhaiBot actualizada.",
+      detail: { botId: String(botId).trim(), habilitado: typeof enabled === "boolean" ? enabled : true },
+    });
     return res.status(200).json({
       success: true,
       message: "Configuración de WhaiBot guardada exitosamente.",
@@ -2848,7 +3155,7 @@ app.get("/api/integrations/whaibot/status", async (req, res) => {
 
 // Enviar un mensaje de prueba de WhatsApp (vía WhaiBot) a los números del cliente.
 // Acepta { to: "<numero>" } o { numbers: ["<numero>", ...] }.
-app.post("/api/integrations/whaibot/send-test", requireAdmin, async (req, res) => {
+app.post("/api/integrations/whaibot/send-test", async (req, res) => {
   try {
     const { to, numbers } = req.body;
 
@@ -2953,7 +3260,7 @@ app.post("/api/integrations/whaibot/send-test", requireAdmin, async (req, res) =
 
 // Endpoint para enviar correos por SMTP
 app.post("/api/sendmail", async (req, res) => {
-  let { to, subject, message, templateType, templateData, isNotification } =
+  let { to, subject, message, templateType, templateData, isNotification, lang } =
     req.body;
 
   if (!to || !Array.isArray(to) || to.length === 0) {
@@ -2969,6 +3276,17 @@ app.post("/api/sendmail", async (req, res) => {
   // permite con token administrativo; el flujo normal usa plantillas.
   if (!templateType && !requireAdminToken(req, res)) return;
 
+  // En staging no sale ningún correo de notificación: comparte SMTP y base de
+  // datos con producción y el cliente recibiría todo por duplicado.
+  if (notificationsBlocked()) {
+    console.warn(`🚫 [Sendmail] ${blockedReason()}. Destinatarios omitidos: ${to.length}`);
+    return res.status(409).json({
+      success: false,
+      code: "ENVIRONMENT_BLOCKED",
+      message: `${blockedReason()}. Este entorno no envía correos a los clientes.`,
+    });
+  }
+
   try {
     const emailSettings = await getEmailSettings();
 
@@ -2980,14 +3298,23 @@ app.post("/api/sendmail", async (req, res) => {
     }
 
     let text;
+    let sentLanguage = null;
 
     // Si se recibe un templateType, generamos el HTML en el backend
     if (templateType && templateData) {
       let template;
+      // Idioma: el que indique quien llama y, si no lo indica, el configurado
+      // por el destinatario. Sin ninguno de los dos, español.
+      const language =
+        lang ||
+        templateData?.lang ||
+        templateData?.language ||
+        (await languageForRecipients(to));
+      sentLanguage = language;
       const payload =
         templateData && typeof templateData === "object"
-          ? { ...templateData, settings: emailSettings }
-          : { settings: emailSettings };
+          ? { ...templateData, settings: emailSettings, lang: language }
+          : { settings: emailSettings, lang: language };
 
       if (isNotification) {
         template = generateNotificationEmailTemplate(templateType, payload);
@@ -3017,6 +3344,13 @@ app.post("/api/sendmail", async (req, res) => {
     });
 
     console.log(`✅ Correo enviado con éxito. ID: ${result.id}`);
+    logEvent({
+      type: EVENT.EMAIL_SENT,
+      req,
+      target: to.join(", "),
+      message: `Correo "${templateType || "personalizado"}" enviado a ${to.length} destinatario(s).`,
+      detail: { plantilla: templateType || null, idioma: sentLanguage, rechazados: result.rejected?.length || 0 },
+    });
     return res.status(200).json({
       success: true,
       message: "Correos enviados con éxito",
@@ -3025,6 +3359,14 @@ app.post("/api/sendmail", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error al enviar correo (SMTP):", error.message);
+    logEvent({
+      type: EVENT.EMAIL_SENT,
+      req,
+      target: to.join(", "),
+      success: false,
+      message: `Fallo al enviar correo: ${error.message}`,
+      detail: { plantilla: templateType || null },
+    });
     return res.status(502).json({
       success: false,
       message:

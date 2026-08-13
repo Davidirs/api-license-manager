@@ -6,6 +6,8 @@ const {
   generateNotificationEmailTemplate,
 } = require("../utils/emailTemplates");
 const { getEmailSettings } = require("../utils/appSettings");
+const { notificationsBlocked, blockedReason } = require("../utils/environment");
+const { languageForRecipients } = require("../utils/userLanguage");
 
 // IONOS limita el envío por hora y las conexiones simultáneas. El limiter de
 // BullMQ es global a la cola (compartido entre réplicas vía Redis), así que
@@ -62,8 +64,19 @@ if (isQueueEnabled()) {
 /**
  * Genera y envía un correo. El remitente sale de la configuración del admin
  * (settings/email), no de una constante hardcodeada.
+ *
+ * El idioma sale de `data.lang` (lo manda el monitor, que ya conoce al usuario)
+ * y, si no viene, se resuelve a partir del destinatario. Sin nada de eso,
+ * español.
  */
 async function sendEmailDirect(tipo, data, to, isNotification) {
+  // Segunda barrera del bloqueo de staging: los jobs ya encolados antes del
+  // despliegue tampoco deben salir.
+  if (notificationsBlocked()) {
+    console.warn(`🚫 [Email] ${blockedReason()}. Se omite '${tipo}' a ${to}.`);
+    return { skipped: true, reason: "environment_blocked" };
+  }
+
   const settings = await getEmailSettings();
 
   if (settings.enabled === false) {
@@ -71,9 +84,15 @@ async function sendEmailDirect(tipo, data, to, isNotification) {
     return { skipped: true, reason: "email_disabled" };
   }
 
+  const lang =
+    (data && typeof data === "object" && (data.lang || data.language)) ||
+    (await languageForRecipients(to));
+
   // Las plantillas usan supportEmail/footer desde la configuración.
   const payload =
-    data && typeof data === "object" ? { ...data, settings } : { settings };
+    data && typeof data === "object"
+      ? { ...data, settings, lang }
+      : { settings, lang };
 
   const template = isNotification
     ? generateNotificationEmailTemplate(tipo, payload)
@@ -112,6 +131,16 @@ async function sendEmailDirect(tipo, data, to, isNotification) {
 async function enqueueEmail(tipo, data, to, isNotification = false, options = {}) {
   const recipients = [...new Set((Array.isArray(to) ? to : [to]).filter(Boolean))];
   if (recipients.length === 0) return { enqueued: 0 };
+
+  // Staging comparte base de datos y SMTP con producción: sin este corte, cada
+  // cliente recibiría por duplicado toda alerta y todo reporte. Se corta ya en
+  // el encolado para no llenar Redis de jobs que nunca deben enviarse.
+  if (notificationsBlocked()) {
+    console.warn(
+      `🚫 [Queue] ${blockedReason()}. Se omiten ${recipients.length} correo(s) de tipo '${tipo}'.`,
+    );
+    return { enqueued: 0, skipped: recipients.length, reason: "environment_blocked" };
+  }
 
   if (!isQueueEnabled() || !emailQueue) {
     // Desarrollo local sin Redis: envío síncrono, secuencial.

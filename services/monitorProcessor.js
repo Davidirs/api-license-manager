@@ -21,6 +21,7 @@ const {
   distinctThresholds,
   thresholdFor,
 } = require("../utils/monitorMetrics");
+const { normalizeLanguage } = require("../utils/emailI18n");
 
 // Ventana para reintentar el reporte final si el envío del día siguiente falló.
 const FINAL_REPORT_WINDOW_DAYS = Number(process.env.MONITOR_FINAL_REPORT_WINDOW_DAYS) || 5;
@@ -90,6 +91,33 @@ function parseHour(value) {
 
 function recipientsOf(user) {
   return [...new Set((user?.preferences?.recipients || []).filter(Boolean))];
+}
+
+/** Idioma de las plantillas para un usuario. Sin preferencia, español. */
+function languageOf(user) {
+  return normalizeLanguage(user?.preferences?.language);
+}
+
+/**
+ * Agrupa destinatarios por idioma.
+ *
+ * Una alerta cubre a todos los usuarios que comparten umbral, y esos usuarios
+ * pueden tener idiomas distintos: se manda un envío por idioma en vez de uno
+ * solo en el idioma del primero. Devuelve [idioma, destinatarios[]].
+ */
+function recipientsByLanguage(users) {
+  const groups = new Map();
+
+  for (const user of users) {
+    const lang = languageOf(user);
+    const bucket = groups.get(lang) || new Set();
+    recipientsOf(user).forEach((email) => bucket.add(email));
+    groups.set(lang, bucket);
+  }
+
+  return [...groups.entries()]
+    .map(([lang, emails]) => [lang, [...emails]])
+    .filter(([, emails]) => emails.length > 0);
 }
 
 /**
@@ -244,46 +272,54 @@ async function processOrgMonitor(jobData) {
     if (decision.action === "none") continue;
 
     const usersForThreshold = users.filter((u) => thresholdFor(u) === threshold);
-    const recipients = [...new Set(usersForThreshold.flatMap(recipientsOf))];
+    // Un envío por idioma: los usuarios que comparten umbral no tienen por qué
+    // compartir el idioma en el que quieren recibir el correo.
+    const groups = recipientsByLanguage(usersForThreshold);
 
-    if (decision.action === "alert" && recipients.length > 0) {
-      await enqueueEmail(
-        "alert",
-        {
-          client,
-          kpis: evaluation.kpis,
-          critical: evaluation.critical,
-          threshold,
-          estimatedCost: evaluation.estimatedCost,
-          periodClosed: current.periodClosed,
-          projection: buildProjection(client, evaluation.kpis),
-        },
-        recipients,
-        true,
-        { dedupeKey: `alert:${orgId}:${threshold}:${shortHash(evaluation.signature)}` },
-      );
-      summary.alerts += recipients.length;
+    if (decision.action === "alert") {
+      for (const [lang, recipients] of groups) {
+        await enqueueEmail(
+          "alert",
+          {
+            client,
+            kpis: evaluation.kpis,
+            critical: evaluation.critical,
+            threshold,
+            estimatedCost: evaluation.estimatedCost,
+            periodClosed: current.periodClosed,
+            projection: buildProjection(client, evaluation.kpis),
+            lang,
+          },
+          recipients,
+          true,
+          { dedupeKey: `alert:${orgId}:${threshold}:${shortHash(evaluation.signature)}` },
+        );
+        summary.alerts += recipients.length;
+      }
     }
 
-    if (decision.action === "recovered" && recipients.length > 0) {
+    if (decision.action === "recovered") {
       const resolved = previousNames(previousState).filter(
         (name) => !evaluation.critical.some((k) => k.name === name),
       );
-      await enqueueEmail(
-        "recovered",
-        {
-          client,
-          kpis: evaluation.kpis,
-          critical: evaluation.critical,
-          threshold,
-          resolved,
-          periodClosed: current.periodClosed,
-        },
-        recipients,
-        true,
-        { dedupeKey: `recovered:${orgId}:${threshold}:${current.periodId}` },
-      );
-      summary.recovered += recipients.length;
+      for (const [lang, recipients] of groups) {
+        await enqueueEmail(
+          "recovered",
+          {
+            client,
+            kpis: evaluation.kpis,
+            critical: evaluation.critical,
+            threshold,
+            resolved,
+            periodClosed: current.periodClosed,
+            lang,
+          },
+          recipients,
+          true,
+          { dedupeKey: `recovered:${orgId}:${threshold}:${current.periodId}` },
+        );
+        summary.recovered += recipients.length;
+      }
     }
 
     nextThresholdState[stateKey] = {
@@ -355,6 +391,7 @@ async function processOrgMonitor(jobData) {
             critical: evaluation.critical,
             threshold,
             estimatedCost: evaluation.estimatedCost,
+            lang: languageOf(user),
           },
           recipientsOf(user),
           true,
@@ -409,6 +446,7 @@ async function processOrgMonitor(jobData) {
         estimatedCost: evaluation.estimatedCost,
         periodClosed: current.periodClosed,
         projection: buildProjection(client, evaluation.kpis),
+        lang: languageOf(user),
       },
       recipients,
       true,

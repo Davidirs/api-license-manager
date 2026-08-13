@@ -23,6 +23,34 @@ El sistema utiliza tres colecciones principales en Firestore para segmentar por 
    - Contiene las credenciales máster de Genesys Cloud por cada Thrusted (ej. `ESMT-DEV`, `ESMT-DEV-W2`).
    - Campos: `name` (thrusted), `clientId`, `clientSecret`, `orgId`, `region`.
 
+4. **`accessLogs`**:
+   - ID del documento: generado por Firestore.
+   - Registro de conexión y acceso que escribe `utils/auditLog.js`.
+   - Campos: `type`, `category` (`auth` | `action`), `success`, `username`, `role`,
+     `orgname`, `orgId`, `target`, `message`, `ip`, `userAgent`, `method`, `path`,
+     `detail`, `timestamp` (epoch ms) y `createdAt` (ISO).
+   - Se consulta desde la pestaña **Logs** de `/settings` (sólo administrador) vía
+     `GET /api/logs`. Un cron diario purga lo anterior a `LOG_RETENTION_DAYS` (90
+     por defecto). Los índices compuestos recomendados están en
+     `firestore.indexes.json`; sin ellos la consulta sigue funcionando filtrando
+     en memoria.
+
+## Idioma de los correos
+
+Cada usuario tiene `preferences.language` (`es` | `en` | `pt`), elegido al crearlo
+desde `/settings`. Las plantillas de `utils/emailTemplates.js` se renderizan en ese
+idioma usando el diccionario de `utils/emailI18n.js`; **sin idioma configurado se
+envía en español**. El monitor agrupa a los destinatarios por idioma, de modo que
+una misma alerta sale en varios idiomas si sus usuarios los tienen distintos.
+
+## Variables de entorno destacadas
+
+| Variable | Efecto |
+| --- | --- |
+| `ENTORNO` | Con el valor `STAGING` **no se envía ninguna notificación** (alertas, reportes y correos de alta/actualización de usuario). Evita que staging duplique los correos que ya manda producción, ya que comparten SMTP y base de datos. El correo de prueba del administrador (`POST /api/settings/email/test`) sí sigue funcionando para poder validar las credenciales SMTP. |
+| `LOG_RETENTION_DAYS` | Días que se conservan los registros de `accessLogs` (90 por defecto). |
+| `LOG_PURGE_CRON` | Expresión cron de la purga de logs (`30 3 * * *` por defecto). |
+
 ## Endpoints
 
 ### 1. Generar Token de Genesys Cloud

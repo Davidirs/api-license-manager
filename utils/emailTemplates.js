@@ -7,12 +7,17 @@ const {
   toNumber,
 } = require("./monitorMetrics");
 const { DEFAULT_EMAIL_SETTINGS } = require("./appSettings");
+const { translator, normalizeLanguage } = require("./emailI18n");
 
-function formatDate(dateString) {
+// Todas las plantillas se renderizan en el idioma del destinatario
+// (`preferences.language`). El traductor `t` viaja por los helpers en vez de
+// tener los textos incrustados en el HTML.
+
+function formatDate(dateString, t) {
   if (!dateString) return "—";
   const d = new Date(dateString);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("es-ES", {
+  return d.toLocaleDateString(t.locale, {
     year: "numeric",
     month: "long",
     day: "numeric",
@@ -20,8 +25,14 @@ function formatDate(dateString) {
   });
 }
 
-function formatMoney(amount) {
-  return `$${toNumber(amount).toLocaleString("es-MX", {
+function formatNumber(value, t) {
+  return toNumber(value).toLocaleString(t.numberLocale);
+}
+
+function formatMoney(amount, t) {
+  // Compatibilidad: se sigue admitiendo la llamada sin traductor (español).
+  const translate = typeof t === "function" ? t : translator();
+  return `$${toNumber(amount).toLocaleString(translate.numberLocale, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })} USD`;
@@ -36,23 +47,16 @@ function getProgressBarColor(percentage) {
   return "#16a34a";
 }
 
-const STATUS_LABEL = {
-  [STATUS.EXCEEDED]: "SOBREUSO",
-  [STATUS.WARNING]: "UMBRAL SUPERADO",
-  [STATUS.ON_DEMAND]: "CONSUMO ON-DEMAND",
-  [STATUS.OK]: "En rango",
+const STATUS_KEY = {
+  [STATUS.EXCEEDED]: "status.exceeded",
+  [STATUS.WARNING]: "status.warning",
+  [STATUS.ON_DEMAND]: "status.on_demand",
+  [STATUS.OK]: "status.ok",
 };
 
-const CATEGORY_LABEL = {
-  licencia: "Licencias",
-  addon: "Add-ons",
-  recurso: "Recursos",
-  ai: "AI Experience",
-  dispositivo: "Dispositivos",
-  almacenamiento: "Almacenamiento",
-  tokens: "IA Tokens",
-  fairuse: "Fair Use (Voz y Outbound)",
-};
+function statusLabel(status, t) {
+  return t(STATUS_KEY[status] || "status.ok");
+}
 
 const CATEGORY_ORDER = [
   "licencia",
@@ -65,11 +69,11 @@ const CATEGORY_ORDER = [
   "dispositivo",
 ];
 
-function footerHtml(settings) {
+function footerHtml(settings, t) {
   const support = settings.supportEmail || DEFAULT_EMAIL_SETTINGS.supportEmail;
   return `<p style="margin: 0; padding: 0; font-size: 14px; opacity: 0.8; color: white;">
-                Este correo fue enviado automáticamente por el sistema de monitoreo de <strong>License Manager</strong>.<br />
-                Si tienes dudas, contáctanos a <a href="mailto:${support}" style="color: #60a5fa;">${support}</a>.<br />
+                ${t("footer.auto")}<br />
+                ${t("footer.doubts")} <a href="mailto:${support}" style="color: #60a5fa;">${support}</a>.<br />
                 © ${new Date().getFullYear()} License Manager
               </p>`;
 }
@@ -87,6 +91,7 @@ function normalizePayload(payload = {}) {
   const client = isMonitorPayload ? payload.client : payload;
   const settings = { ...DEFAULT_EMAIL_SETTINGS, ...(payload.settings || {}) };
   const threshold = toNumber(payload.threshold) || 90;
+  const t = translator(payload.lang || payload.language);
 
   let kpis = isMonitorPayload && Array.isArray(payload.kpis) ? payload.kpis : null;
   if (!kpis) {
@@ -108,17 +113,19 @@ function normalizePayload(payload = {}) {
 
   return {
     client: client || {},
-    orgName: (client && client.name) || "Organización",
+    orgName: (client && client.name) || t("org.fallback"),
     kpis,
     critical,
     threshold,
     settings,
+    t,
+    lang: t.language,
     estimatedCost:
       payload.estimatedCost !== undefined
         ? toNumber(payload.estimatedCost)
         : critical.reduce((sum, k) => sum + toNumber(k.estimatedCost), 0),
-    periodStart: formatDate(client?.facturacion?.inicio),
-    periodEnd: formatDate(client?.facturacion?.final),
+    periodStart: formatDate(client?.facturacion?.inicio, t),
+    periodEnd: formatDate(client?.facturacion?.final, t),
     periodClosed: Boolean(payload.periodClosed),
     resolved: Array.isArray(payload.resolved) ? payload.resolved : [],
     projection: payload.projection || null,
@@ -127,18 +134,23 @@ function normalizePayload(payload = {}) {
 
 // ── Bloques HTML reutilizables ───────────────────────────────────────────────
 
-function kpiBarRow(kpi) {
+function kpiBarRow(kpi, t) {
   const pct = kpi.percentage;
   const barWidth = pct === null ? 0 : Math.min(pct, 100);
   const color = getProgressBarColor(pct);
+  const unit = kpi.unit ? " " + kpi.unit : "";
   const rightLabel =
     kpi.total > 0
-      ? `${kpi.used.toLocaleString("es-MX")} / ${kpi.total.toLocaleString("es-MX")}${kpi.unit ? " " + kpi.unit : ""}`
-      : `${kpi.used.toLocaleString("es-MX")}${kpi.unit ? " " + kpi.unit : ""}`;
+      ? `${formatNumber(kpi.used, t)} / ${formatNumber(kpi.total, t)}${unit}`
+      : `${formatNumber(kpi.used, t)}${unit}`;
   const footNote =
     pct === null
-      ? "Sin compromiso contratado (on-demand)"
-      : `${pct}% utilizado${kpi.included > 0 ? ` · incluye ${kpi.included.toLocaleString("es-MX")} de fair use` : ""}`;
+      ? t("kpi.no_commitment")
+      : `${t("kpi.used_pct", { value: pct })}${
+          kpi.included > 0
+            ? t("kpi.fairuse_included", { value: formatNumber(kpi.included, t) })
+            : ""
+        }`;
 
   return `
     <table width="100%" cellpadding="0" cellspacing="0" style="border: 1px solid #e2e8f0; border-radius: 8px; background: #fefefe; margin-bottom: 12px;">
@@ -159,30 +171,33 @@ function kpiBarRow(kpi) {
     </table>`;
 }
 
-function kpiCriticalCard(kpi) {
+function kpiCriticalCard(kpi, t) {
   const pct = kpi.percentage;
   const barWidth = pct === null ? 100 : Math.min(pct, 100);
   const accent = kpi.status === STATUS.ON_DEMAND ? "#ea580c" : "#dc2626";
   const bg = kpi.status === STATUS.ON_DEMAND ? "#fff7ed" : "#fef2f2";
+  const unit = kpi.unit ? " " + kpi.unit : "";
   const rightLabel =
     kpi.total > 0
-      ? `${kpi.used.toLocaleString("es-MX")} / ${kpi.total.toLocaleString("es-MX")}${kpi.unit ? " " + kpi.unit : ""}`
-      : `${kpi.used.toLocaleString("es-MX")}${kpi.unit ? " " + kpi.unit : ""}`;
+      ? `${formatNumber(kpi.used, t)} / ${formatNumber(kpi.total, t)}${unit}`
+      : `${formatNumber(kpi.used, t)}${unit}`;
 
   const detail =
     kpi.overage > 0
-      ? `Sobreuso: ${kpi.overage.toLocaleString("es-MX")}${kpi.unit ? " " + kpi.unit : ""}${
-          kpi.estimatedCost > 0 ? ` · costo estimado ${formatMoney(kpi.estimatedCost)}` : ""
+      ? `${t("kpi.overage", { value: `${formatNumber(kpi.overage, t)}${unit}` })}${
+          kpi.estimatedCost > 0
+            ? t("kpi.overage_cost", { amount: formatMoney(kpi.estimatedCost, t) })
+            : ""
         }`
       : pct !== null
-        ? `${pct}% utilizado`
-        : "Consumo sin compromiso contratado";
+        ? t("kpi.used_pct", { value: pct })
+        : t("kpi.on_demand_detail");
 
   return `
     <div style="border: 1px solid ${accent}; border-radius: 8px; padding: 16px 20px; background: ${bg}; margin-bottom: 12px;">
       <table width="100%" cellpadding="0" cellspacing="0">
         <tr>
-          <td align="left" style="font-size: 14px; font-weight: 600; color: ${accent};">🔴 ${kpi.name} — ${STATUS_LABEL[kpi.status]}</td>
+          <td align="left" style="font-size: 14px; font-weight: 600; color: ${accent};">🔴 ${kpi.name} — ${statusLabel(kpi.status, t)}</td>
           <td align="right" style="font-size: 16px; font-weight: 700; color: ${accent};">${rightLabel}</td>
         </tr>
       </table>
@@ -193,7 +208,7 @@ function kpiCriticalCard(kpi) {
     </div>`;
 }
 
-function groupedKpiSections(kpis, { onlyRelevant = true } = {}) {
+function groupedKpiSections(kpis, t, { onlyRelevant = true } = {}) {
   const visible = onlyRelevant
     ? kpis.filter((k) => k.used > 0 || k.total > 0)
     : kpis;
@@ -202,33 +217,36 @@ function groupedKpiSections(kpis, { onlyRelevant = true } = {}) {
     const items = visible.filter((k) => k.category === category);
     if (items.length === 0) return "";
     return `
-      <h3 style="margin: 24px 0 12px 0; color: #1e293b; font-size: 16px; font-weight: 600;">${CATEGORY_LABEL[category]}</h3>
-      ${items.map(kpiBarRow).join("")}`;
+      <h3 style="margin: 24px 0 12px 0; color: #1e293b; font-size: 16px; font-weight: 600;">${t(`category.${category}`)}</h3>
+      ${items.map((kpi) => kpiBarRow(kpi, t)).join("")}`;
   }).join("");
 }
 
-function costBanner(estimatedCost) {
+function costBanner(estimatedCost, t) {
   if (!(estimatedCost > 0)) return "";
   return `
     <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 16px; margin-bottom: 24px; text-align: center;">
-      <h3 style="margin: 0 0 4px 0; color: #dc2626; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Costo estimado de sobreuso</h3>
-      <p style="margin: 0; color: #991b1b; font-size: 22px; font-weight: 700;">${formatMoney(estimatedCost)}</p>
-      <p style="margin: 4px 0 0 0; color: #991b1b; font-size: 12px;">Estimación según tarifas de Fair Use; la factura final la emite Genesys.</p>
+      <h3 style="margin: 0 0 4px 0; color: #dc2626; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">${t("cost.title")}</h3>
+      <p style="margin: 0; color: #991b1b; font-size: 22px; font-weight: 700;">${formatMoney(estimatedCost, t)}</p>
+      <p style="margin: 4px 0 0 0; color: #991b1b; font-size: 12px;">${t("cost.note")}</p>
     </div>`;
 }
 
-function projectionBanner(projection) {
+function projectionBanner(projection, t) {
   if (!projection || !projection.items || projection.items.length === 0) return "";
   return `
     <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
-      <h3 style="margin: 0 0 8px 0; color: #b45309; font-size: 15px; font-weight: 600;">📈 Proyección al cierre del período (día ${projection.elapsedDays} de ${projection.totalDays})</h3>
+      <h3 style="margin: 0 0 8px 0; color: #b45309; font-size: 15px; font-weight: 600;">${t("projection.title", {
+        elapsed: projection.elapsedDays,
+        total: projection.totalDays,
+      })}</h3>
       ${projection.items
         .map(
           (item) => `
         <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 6px;">
           <tr>
             <td align="left" style="color: #78350f; font-size: 13px;">${item.name}</td>
-            <td align="right" style="color: #b45309; font-size: 13px; font-weight: 600;">${item.projectedPercentage}% proyectado</td>
+            <td align="right" style="color: #b45309; font-size: 13px; font-weight: 600;">${t("projection.item", { value: item.projectedPercentage })}</td>
           </tr>
         </table>`,
         )
@@ -245,9 +263,9 @@ function periodBanner(title, start, end, extraNote) {
     </div>`;
 }
 
-function shell({ headerColor, title, subtitle, body, orgName, footerColor, settings }) {
+function shell({ headerColor, title, subtitle, body, orgName, footerColor, settings, t }) {
   return `<!DOCTYPE html>
-<html lang="es">
+<html lang="${t.language}">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -263,8 +281,8 @@ function shell({ headerColor, title, subtitle, body, orgName, footerColor, setti
         ${body}
       </div>
       <div style="background: ${footerColor || "#1e293b"}; color: white; padding: 24px; text-align: center;">
-        <p style="margin: 0 0 16px 0; font-size: 14px; opacity: 0.8;">Reporte generado automáticamente para ${orgName}</p>
-        ${footerHtml(settings)}
+        <p style="margin: 0 0 16px 0; font-size: 14px; opacity: 0.8;">${t("footer.generated_for", { org: orgName })}</p>
+        ${footerHtml(settings, t)}
       </div>
     </div>
   </body>
@@ -275,46 +293,47 @@ function shell({ headerColor, title, subtitle, body, orgName, footerColor, setti
 
 function generateNotificationEmailTemplate(templateType, payload) {
   const ctx = normalizePayload(payload);
-  const { orgName, kpis, critical, threshold, settings, periodStart, periodEnd } = ctx;
+  const { orgName, kpis, critical, threshold, settings, periodStart, periodEnd, t } = ctx;
 
   switch (templateType) {
     case "current": {
-      const note = ctx.periodClosed
-        ? "⚠️ Este período de facturación ya cerró; Genesys aún no publica el nuevo período. Las cifras son las del período mostrado."
-        : "";
+      const note = ctx.periodClosed ? t("current.period_closed_note") : "";
       const body = `
-        ${periodBanner("Período de Facturación", periodStart, periodEnd, note)}
-        ${costBanner(ctx.estimatedCost)}
-        ${projectionBanner(ctx.projection)}
+        ${periodBanner(t("current.period"), periodStart, periodEnd, note)}
+        ${costBanner(ctx.estimatedCost, t)}
+        ${projectionBanner(ctx.projection, t)}
         ${
           critical.length > 0
             ? `<div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-                 <h3 style="margin: 0 0 8px 0; color: #dc2626; font-size: 15px; font-weight: 600;">Atención en ${critical.length} métrica(s)</h3>
+                 <h3 style="margin: 0 0 8px 0; color: #dc2626; font-size: 15px; font-weight: 600;">${t("current.attention", { count: critical.length })}</h3>
                  <p style="margin: 0; color: #991b1b; font-size: 13px;">${critical.map((k) => k.name).join(", ")}</p>
                </div>`
             : `<div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-                 <p style="margin: 0; color: #065f46; font-size: 14px;">✅ Todo el consumo está dentro de lo contratado (umbral de alerta: ${threshold}%).</p>
+                 <p style="margin: 0; color: #065f46; font-size: 14px;">${t("current.all_ok", { threshold })}</p>
                </div>`
         }
-        ${groupedKpiSections(kpis)}`;
+        ${groupedKpiSections(kpis, t)}`;
 
       return {
-        subject: `📈 Reporte Actual - ${orgName} | Estado de Licencias`,
+        subject: t("current.subject", { org: orgName }),
         html: shell({
           headerColor: "#3b82f6",
-          title: "📈 Reporte Actual",
-          subtitle: "Estado actual de licencias y recursos",
+          title: t("current.title"),
+          subtitle: t("current.subtitle"),
           body,
           orgName,
           settings,
+          t,
         }),
         text: [
-          `Reporte de Estado Actual - ${orgName}`,
-          `Período: ${periodStart} - ${periodEnd}`,
+          t("current.text_title", { org: orgName }),
+          t("text.period", { start: periodStart, end: periodEnd }),
           "",
           ...kpis.filter((k) => k.used > 0 || k.total > 0).map((k) => k.label),
           "",
-          ctx.estimatedCost > 0 ? `Costo estimado de sobreuso: ${formatMoney(ctx.estimatedCost)}` : "",
+          ctx.estimatedCost > 0
+            ? t("cost.summary", { amount: formatMoney(ctx.estimatedCost, t) })
+            : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -326,7 +345,10 @@ function generateNotificationEmailTemplate(templateType, payload) {
         .filter((k) => k.category === "licencia" && k.total > 0)
         .map((k) => {
           const available = Math.max(0, k.total - k.used);
-          return `<p style="margin: 0 0 8px 0; font-size: 14px; color: #333;">${k.name}: ${available.toLocaleString("es-MX")} licencias disponibles</p>`;
+          return `<p style="margin: 0 0 8px 0; font-size: 14px; color: #333;">${t("previous.available_item", {
+            name: k.name,
+            count: formatNumber(available, t),
+          })}</p>`;
         })
         .join("");
 
@@ -337,40 +359,45 @@ function generateNotificationEmailTemplate(templateType, payload) {
           : 0;
 
       const body = `
-        ${periodBanner("Período Completado", periodStart, periodEnd)}
-        ${costBanner(ctx.estimatedCost)}
+        ${periodBanner(t("previous.period"), periodStart, periodEnd)}
+        ${costBanner(ctx.estimatedCost, t)}
         <div style="background: #f8fafc; border-radius: 8px; padding: 20px; margin-bottom: 24px;">
-          <h3 style="margin: 0 0 8px 0; color: #1e293b; font-size: 18px; font-weight: 600;">Resumen Final de Uso</h3>
-          ${groupedKpiSections(kpis)}
+          <h3 style="margin: 0 0 8px 0; color: #1e293b; font-size: 18px; font-weight: 600;">${t("previous.summary")}</h3>
+          ${groupedKpiSections(kpis, t)}
         </div>
         <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; background: #fefefe; margin-bottom: 20px;">
-          <h3 style="margin: 0 0 12px 0; color: #16a34a; font-size: 16px; font-weight: 600;">✅ Licencias Disponibles</h3>
-          ${availability || '<p style="margin: 0; font-size: 14px; color: #64748b;">Sin licencias con compromiso en el período.</p>'}
+          <h3 style="margin: 0 0 12px 0; color: #16a34a; font-size: 16px; font-weight: 600;">${t("previous.available_licenses")}</h3>
+          ${availability || `<p style="margin: 0; font-size: 14px; color: #64748b;">${t("previous.no_commitment_licenses")}</p>`}
         </div>
         <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; background: #fefefe;">
-          <h3 style="margin: 0 0 12px 0; color: #3b82f6; font-size: 16px; font-weight: 600;">📈 Eficiencia de Uso</h3>
-          <p style="margin: 0 0 8px 0; font-size: 14px; color: #333;">Promedio de utilización: ${avgUtilization}%</p>
-          <p style="margin: 0; font-size: 14px; color: #333;">Métricas con sobreuso: ${critical.filter((k) => k.status === STATUS.EXCEEDED).length}</p>
+          <h3 style="margin: 0 0 12px 0; color: #3b82f6; font-size: 16px; font-weight: 600;">${t("previous.efficiency")}</h3>
+          <p style="margin: 0 0 8px 0; font-size: 14px; color: #333;">${t("previous.avg_utilization", { value: avgUtilization })}</p>
+          <p style="margin: 0; font-size: 14px; color: #333;">${t("previous.exceeded_count", {
+            count: critical.filter((k) => k.status === STATUS.EXCEEDED).length,
+          })}</p>
         </div>`;
 
       return {
-        subject: `📊 Reporte Final - Período Completado | ${orgName}`,
+        subject: t("previous.subject", { org: orgName }),
         html: shell({
           headerColor: "#16a34a",
-          title: "📊 Reporte Final",
-          subtitle: "Resumen del período de facturación completado",
+          title: t("previous.title"),
+          subtitle: t("previous.subtitle"),
           body,
           orgName,
           settings,
+          t,
         }),
         text: [
-          `Reporte del Período Finalizado - ${orgName}`,
-          `Período: ${periodStart} - ${periodEnd}`,
+          t("previous.text_title", { org: orgName }),
+          t("text.period", { start: periodStart, end: periodEnd }),
           "",
           ...kpis.filter((k) => k.used > 0 || k.total > 0).map((k) => k.label),
           "",
-          `Promedio de utilización: ${avgUtilization}%`,
-          ctx.estimatedCost > 0 ? `Costo estimado de sobreuso: ${formatMoney(ctx.estimatedCost)}` : "",
+          t("previous.avg_utilization", { value: avgUtilization }),
+          ctx.estimatedCost > 0
+            ? t("cost.summary", { amount: formatMoney(ctx.estimatedCost, t) })
+            : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -381,50 +408,56 @@ function generateNotificationEmailTemplate(templateType, payload) {
       const support = settings.supportEmail || DEFAULT_EMAIL_SETTINGS.supportEmail;
       const body = `
         <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-          <h3 style="margin: 0 0 4px 0; color: #dc2626; font-size: 16px; font-weight: 600;">⚠️ ¿Qué ha pasado?</h3>
-          <p style="margin: 0; color: #991b1b; font-size: 14px;">Se detectó consumo por encima de tu umbral configurado (<strong>${threshold}%</strong>) en ${critical.length} métrica(s). Revisa el detalle a continuación.</p>
+          <h3 style="margin: 0 0 4px 0; color: #dc2626; font-size: 16px; font-weight: 600;">${t("alert.what_happened")}</h3>
+          <p style="margin: 0; color: #991b1b; font-size: 14px;">${t("alert.what_happened_desc", {
+            threshold,
+            count: critical.length,
+          })}</p>
         </div>
-        ${periodBanner("Período Actual", periodStart, periodEnd)}
-        ${costBanner(ctx.estimatedCost)}
-        ${projectionBanner(ctx.projection)}
+        ${periodBanner(t("alert.period"), periodStart, periodEnd)}
+        ${costBanner(ctx.estimatedCost, t)}
+        ${projectionBanner(ctx.projection, t)}
         <div style="margin-bottom: 24px;">
           ${
             critical.length > 0
-              ? critical.map(kpiCriticalCard).join("")
-              : '<p style="font-size: 14px; color: #64748b;">Sin métricas por encima del umbral en este momento.</p>'
+              ? critical.map((kpi) => kpiCriticalCard(kpi, t)).join("")
+              : `<p style="font-size: 14px; color: #64748b;">${t("alert.none_above")}</p>`
           }
         </div>
         <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 20px;">
-          <h3 style="margin: 0 0 12px 0; color: #dc2626; font-size: 17px; font-weight: 600;">🚨 Acciones Recomendadas</h3>
-          <p style="margin: 0 0 8px 0; color: #475569; font-size: 14px;">1. Revisar el consumo en tu tablero de License Manager.</p>
-          <p style="margin: 0 0 8px 0; color: #475569; font-size: 14px;">2. Optimizar los recursos activos que aparecen arriba.</p>
-          <p style="margin: 0; color: #475569; font-size: 14px;">3. Contactar a soporte si necesitas ampliar límites: ${support}</p>
+          <h3 style="margin: 0 0 12px 0; color: #dc2626; font-size: 17px; font-weight: 600;">${t("alert.actions")}</h3>
+          <p style="margin: 0 0 8px 0; color: #475569; font-size: 14px;">${t("alert.action_1")}</p>
+          <p style="margin: 0 0 8px 0; color: #475569; font-size: 14px;">${t("alert.action_2")}</p>
+          <p style="margin: 0; color: #475569; font-size: 14px;">${t("alert.action_3", { support })}</p>
         </div>
         <div style="text-align: center; margin-top: 24px;">
-          <a href="mailto:${support}" style="display: inline-block; background: #dc2626; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 500;">📞 Contactar Soporte</a>
+          <a href="mailto:${support}" style="display: inline-block; background: #dc2626; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 500;">${t("alert.contact_support")}</a>
         </div>`;
 
       return {
-        subject: `🚨 Notificación de uso elevado - Genesys Cloud | ${orgName}`,
+        subject: t("alert.subject", { org: orgName }),
         html: shell({
           headerColor: "#dc2626",
           footerColor: "#dc2626",
-          title: "Notificación",
-          subtitle: "Uso elevado detectado - Supervisión del servicio recomendada",
+          title: t("alert.title"),
+          subtitle: t("alert.subtitle"),
           body,
           orgName,
           settings,
+          t,
         }),
         text: [
-          `🚨 Notificación de uso elevado - Genesys Cloud - ${orgName}`,
-          `Umbral configurado: ${threshold}%`,
-          `Período: ${periodStart} - ${periodEnd}`,
+          t("alert.text_title", { org: orgName }),
+          t("alert.text_threshold", { threshold }),
+          t("text.period", { start: periodStart, end: periodEnd }),
           "",
-          "Métricas por encima del umbral:",
-          ...critical.map((k) => `- ${k.label} [${STATUS_LABEL[k.status]}]`),
+          t("alert.text_metrics"),
+          ...critical.map((k) => `- ${k.label} [${statusLabel(k.status, t)}]`),
           "",
-          ctx.estimatedCost > 0 ? `Costo estimado de sobreuso: ${formatMoney(ctx.estimatedCost)}` : "",
-          "Este es un mensaje automático de License Manager.",
+          ctx.estimatedCost > 0
+            ? t("cost.summary", { amount: formatMoney(ctx.estimatedCost, t) })
+            : "",
+          t("alert.text_footer"),
         ]
           .filter(Boolean)
           .join("\n"),
@@ -434,36 +467,39 @@ function generateNotificationEmailTemplate(templateType, payload) {
     case "recovered": {
       const body = `
         <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-          <h3 style="margin: 0 0 4px 0; color: #059669; font-size: 16px; font-weight: 600;">✅ Consumo normalizado</h3>
-          <p style="margin: 0; color: #065f46; font-size: 14px;">Las métricas que habían superado tu umbral (<strong>${threshold}%</strong>) volvieron a estar en rango.</p>
+          <h3 style="margin: 0 0 4px 0; color: #059669; font-size: 16px; font-weight: 600;">${t("recovered.heading")}</h3>
+          <p style="margin: 0; color: #065f46; font-size: 14px;">${t("recovered.desc", { threshold })}</p>
         </div>
-        ${periodBanner("Período Actual", periodStart, periodEnd)}
+        ${periodBanner(t("alert.period"), periodStart, periodEnd)}
         ${
           ctx.resolved.length > 0
             ? `<div style="background: #f8fafc; border-radius: 8px; padding: 20px; margin-bottom: 24px;">
-                 <h3 style="margin: 0 0 12px 0; color: #1e293b; font-size: 16px; font-weight: 600;">Métricas normalizadas</h3>
+                 <h3 style="margin: 0 0 12px 0; color: #1e293b; font-size: 16px; font-weight: 600;">${t("recovered.normalized")}</h3>
                  ${ctx.resolved.map((name) => `<p style="margin: 0 0 6px 0; font-size: 14px; color: #475569;">• ${name}</p>`).join("")}
                </div>`
             : ""
         }
-        ${groupedKpiSections(kpis)}`;
+        ${groupedKpiSections(kpis, t)}`;
 
       return {
-        subject: `✅ Consumo normalizado - ${orgName}`,
+        subject: t("recovered.subject", { org: orgName }),
         html: shell({
           headerColor: "#16a34a",
-          title: "✅ Consumo Normalizado",
-          subtitle: "Ya no hay métricas por encima de tu umbral",
+          title: t("recovered.title"),
+          subtitle: t("recovered.subtitle"),
           body,
           orgName,
           settings,
+          t,
         }),
         text: [
-          `Consumo normalizado - ${orgName}`,
-          `Umbral configurado: ${threshold}%`,
-          `Período: ${periodStart} - ${periodEnd}`,
+          t("recovered.text_title", { org: orgName }),
+          t("alert.text_threshold", { threshold }),
+          t("text.period", { start: periodStart, end: periodEnd }),
           "",
-          ctx.resolved.length > 0 ? `Métricas normalizadas: ${ctx.resolved.join(", ")}` : "",
+          ctx.resolved.length > 0
+            ? t("recovered.text_normalized", { list: ctx.resolved.join(", ") })
+            : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -477,116 +513,123 @@ function generateNotificationEmailTemplate(templateType, payload) {
 
 function generateTemplate(templateType, data) {
   const settings = { ...DEFAULT_EMAIL_SETTINGS, ...(data?.settings || {}) };
+  const t = translator(data?.lang || data?.language);
+  const support = settings.supportEmail || DEFAULT_EMAIL_SETTINGS.supportEmail;
 
   switch (templateType) {
     case "newuser":
       return {
-        subject: `👋 Tu acceso a ${data.orgname} ha sido activado.`,
+        subject: t("newuser.subject", { org: data.orgname }),
         html: `<!DOCTYPE html>
-        <html lang="es">
+        <html lang="${t.language}">
           <head>
             <meta charset="UTF-8">
-            <title>¡Bienvenido/a!</title>
+            <title>${t("newuser.doc_title")}</title>
           </head>
           <body style="margin: 0; padding: 0; background-color: #f9fafb;">
             <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
 
               <div style="padding: 32px 24px; text-align: center; color: white; background:  #10b981;">
-                <h1 style="margin: 0 0 8px 0; font-size: 28px; font-weight: 700;">👋 ¡Bienvenido/a!</h1>
-                <p style="margin: 0; font-size: 16px; opacity: 0.9;">Tu cuenta ha sido creada exitosamente. Es hora de empezar.</p>
+                <h1 style="margin: 0 0 8px 0; font-size: 28px; font-weight: 700;">${t("newuser.title")}</h1>
+                <p style="margin: 0; font-size: 16px; opacity: 0.9;">${t("newuser.subtitle")}</p>
               </div>
 
               <div style="padding: 32px 24px;">
 
                 <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-                  <h3 style="margin: 0 0 4px 0; color: #059669; font-size: 16px; font-weight: 600;">✅ Cuenta Activada</h3>
-                  <p style="margin: 0; color: #065f46; font-size: 14px;">Tu acceso a la organización ${data.orgname} ya está listo. Usa las siguientes credenciales para iniciar sesión.</p>
+                  <h3 style="margin: 0 0 4px 0; color: #059669; font-size: 16px; font-weight: 600;">${t("newuser.activated")}</h3>
+                  <p style="margin: 0; color: #065f46; font-size: 14px;">${t("newuser.activated_desc", { org: data.orgname })}</p>
                 </div>
 
                 <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; margin-bottom: 24px; text-align: center;">
-                  <h3 style="margin: 0 0 4px 0; color: #475569; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Organización</h3>
+                  <h3 style="margin: 0 0 4px 0; color: #475569; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">${t("newuser.organization")}</h3>
                   <p style="margin: 0; color: #1e293b; font-size: 18px; font-weight: 600;">${data.orgname}</p>
                 </div>
 
                 <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 20px; margin-bottom: 32px;">
-                  <h3 style="margin: 0 0 16px 0; color: #2563eb; font-size: 18px; font-weight: 600;">🔑 Tus Credenciales</h3>
+                  <h3 style="margin: 0 0 16px 0; color: #2563eb; font-size: 18px; font-weight: 600;">${t("newuser.credentials")}</h3>
 
                   <div style="display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #dbeafe;">
-                    <span style="color: #475569; font-size: 14px; font-weight: 500;">Nombre de Usuario: </span>
+                    <span style="color: #475569; font-size: 14px; font-weight: 500;">${t("newuser.username")} </span>
                     <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.usuario}</span>
                   </div>
 
                   <div style="display: flex; justify-content: space-between; padding: 10px 0;">
-                    <span style="color: #475569; font-size: 14px; font-weight: 500;">Contraseña Temporal: </span>
+                    <span style="color: #475569; font-size: 14px; font-weight: 500;">${t("newuser.temp_password")} </span>
                     <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.password}</span>
                   </div>
                 </div>
 
                 <div style="text-align: center; margin-top: 24px;">
                   <a style="display: inline-block; background: #2563eb; color: white; padding: 14px 28px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 16px; margin: 16px 0;">
-                    ▶️ Puedes ir a la plataforma e iniciar Sesión.
+                    ${t("newuser.cta")}
                   </a>
                 </div>
 
                 <p style="text-align: center; color: #64748b; font-size: 12px; margin-top: 20px;">
-                  ⚠️ Por motivos de seguridad, te recomendamos cambiar tu contraseña temporal inmediatamente después de iniciar sesión.
+                  ${t("newuser.security_note")}
                 </p>
               </div>
 
               <div style="background: #10b981; color: white; padding: 24px; text-align: center;">
-                <p style="margin: 0 0 8px 0; font-size: 14px; opacity: 0.8;">Este correo es solo para fines informativos. Por favor, no lo respondas.</p>
-                ${footerHtml(settings)}
+                <p style="margin: 0 0 8px 0; font-size: 14px; opacity: 0.8;">${t("newuser.footer_note")}</p>
+                ${footerHtml(settings, t)}
               </div>
             </div>
           </body>
         </html>
         `,
-        text: `🎉 ¡Bienvenido/a a ${data.orgname}! 🎉\n\nTu acceso a los servicios de ${data.orgname} ha sido activado exitosamente.\n\nUsa las siguientes credenciales para iniciar sesión:\n\n================================\n🔑 CREDENCIALES DE ACCESO\n================================\n\nORGANIZACIÓN: ${data.orgname}\nUSUARIO: ${data.usuario}\nCONTRASEÑA TEMPORAL: ${data.password}\n\n--------------------------------\n\n\n ⚠️ RECOMENDACIÓN DE SEGURIDAD:\nPor favor, cambia tu contraseña temporal inmediatamente después de iniciar sesión.\n\nSi tienes algún problema, contacta a soporte en: ${settings.supportEmail}\n\nEste es un mensaje automático.`,
+        text: t("newuser.text", {
+          org: data.orgname,
+          user: data.usuario,
+          password: data.password,
+          support,
+        }),
       };
 
     case "userupdated": {
       const isPasswordUpdate = !!data.password;
 
       return {
-        subject: `✅ Tu perfil en ${data.orgname} ha sido actualizado.`,
+        subject: t("userupdated.subject", { org: data.orgname }),
         html: `<!DOCTYPE html>
-        <html lang="es">
+        <html lang="${t.language}">
           <head>
             <meta charset="UTF-8">
-            <title>Actualización de Perfil</title>
+            <title>${t("userupdated.doc_title")}</title>
           </head>
           <body style="margin: 0; padding: 0; background-color: #f9fafb;">
             <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
 
               <div style="padding: 32px 24px; text-align: center; color: white; background:  #3b82f6;">
-                <h1 style="margin: 0 0 8px 0; font-size: 28px; font-weight: 700;">⚙️ Perfil Actualizado</h1>
-                <p style="margin: 0; font-size: 16px; opacity: 0.9;">Tus datos de usuario en ${data.orgname} han sido modificados.</p>
+                <h1 style="margin: 0 0 8px 0; font-size: 28px; font-weight: 700;">${t("userupdated.title")}</h1>
+                <p style="margin: 0; font-size: 16px; opacity: 0.9;">${t("userupdated.subtitle", { org: data.orgname })}</p>
               </div>
 
               <div style="padding: 32px 24px;">
 
                 <div style="background: #e0f2fe; border: 1px solid #7dd3fc; border-radius: 8px; padding: 16px; margin-bottom: 24px;">
-                  <h3 style="margin: 0 0 4px 0; color: #0284c7; font-size: 16px; font-weight: 600;">🔔 Notificación Importante</h3>
-                  <p style="margin: 0; color: #075985; font-size: 14px;">La información de tu cuenta en la organización <b>${data.orgname}</b> ha sido actualizada recientemente. Si no reconoces esta acción, contacta a tu administrador.</p>
+                  <h3 style="margin: 0 0 4px 0; color: #0284c7; font-size: 16px; font-weight: 600;">${t("userupdated.notice")}</h3>
+                  <p style="margin: 0; color: #075985; font-size: 14px;">${t("userupdated.notice_desc", { org: data.orgname })}</p>
                 </div>
 
                 <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; margin-bottom: 24px; text-align: center;">
-                  <h3 style="margin: 0 0 4px 0; color: #475569; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Organización</h3>
+                  <h3 style="margin: 0 0 4px 0; color: #475569; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">${t("userupdated.organization")}</h3>
                   <p style="margin: 0; color: #1e293b; font-size: 18px; font-weight: 600;">${data.orgname}</p>
                 </div>
 
                 <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 20px; margin-bottom: 32px;">
-                  <h3 style="margin: 0 0 16px 0; color: #2563eb; font-size: 18px; font-weight: 600;">👤 Detalles de la Cuenta</h3>
+                  <h3 style="margin: 0 0 16px 0; color: #2563eb; font-size: 18px; font-weight: 600;">${t("userupdated.details")}</h3>
 
                   <div style="display: flex; justify-content: space-between; padding: 10px 0;">
-                    <span style="color: #475569; font-size: 14px; font-weight: 500;">Nombre de Usuario: </span>
+                    <span style="color: #475569; font-size: 14px; font-weight: 500;">${t("userupdated.username")} </span>
                     <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.usuario}</span>
                   </div>
 
                   ${
                     isPasswordUpdate
                       ? `<div style="display: flex; padding: 10px 0; border-top: 1px solid #dbeafe;">
-                        <p style="margin: 0; color: #dc2626; font-size: 14px; font-weight: 600;">* NOTA: Tu contraseña fue modificada.</p>
+                        <p style="margin: 0; color: #dc2626; font-size: 14px; font-weight: 600;">${t("userupdated.password_changed")}</p>
                     </div>`
                       : ""
                   }
@@ -594,7 +637,7 @@ function generateTemplate(templateType, data) {
                   ${
                     data.role
                       ? `<div style="display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid #dbeafe;">
-                                <span style="color: #475569; font-size: 14px; font-weight: 500;">Rol Actual: </span>
+                                <span style="color: #475569; font-size: 14px; font-weight: 500;">${t("userupdated.role")} </span>
                                 <span style="color: #1e293b; font-size: 14px; font-weight: 600;">${data.role}</span>
                             </div>`
                       : ""
@@ -604,24 +647,29 @@ function generateTemplate(templateType, data) {
 
                 <div style="text-align: center; margin-top: 24px;">
                   <a style="display: inline-block; background: #3b82f6; color: white; padding: 14px 28px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 16px; margin: 16px 0;">
-                    Puedes acceder de nuevo a la Plataforma.
+                    ${t("userupdated.cta")}
                   </a>
                 </div>
 
                 <p style="text-align: center; color: #64748b; font-size: 12px; margin-top: 20px;">
-                  Si no realizaste esta acción o si tienes preguntas, contacta al soporte de tu organización inmediatamente.
+                  ${t("userupdated.help")}
                 </p>
               </div>
 
               <div style="background: #3b82f6; color: white; padding: 24px; text-align: center;">
-                <p style="margin: 0 0 8px 0; font-size: 14px; opacity: 0.8;">Este correo es una notificación de seguridad. Por favor, no lo respondas.</p>
-                ${footerHtml(settings)}
+                <p style="margin: 0 0 8px 0; font-size: 14px; opacity: 0.8;">${t("userupdated.footer_note")}</p>
+                ${footerHtml(settings, t)}
               </div>
             </div>
           </body>
         </html>
         `,
-        text: `✅ Actualización de Perfil en ${data.orgname} ✅\n\nTu información de usuario en ${data.orgname} ha sido actualizada exitosamente.\n\n================================\n👤 DETALLES DE LA CUENTA\n================================\n\nORGANIZACIÓN: ${data.orgname}\nUSUARIO: ${data.usuario}\n${isPasswordUpdate ? "⚠️ NOTA: Tu contraseña fue cambiada.\n" : ""}\n--------------------------------\n\nSi no realizaste esta acción o si tienes preguntas, contacta a soporte en: ${settings.supportEmail}\n\nEste es un mensaje automático.`,
+        text: t("userupdated.text", {
+          org: data.orgname,
+          user: data.usuario,
+          passwordNote: isPasswordUpdate ? t("userupdated.text_password_note") : "",
+          support,
+        }),
       };
     }
 
@@ -635,4 +683,5 @@ module.exports = {
   generateTemplate,
   normalizePayload,
   formatMoney,
+  normalizeLanguage,
 };

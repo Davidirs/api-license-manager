@@ -6,6 +6,7 @@
 // que cierra eso.
 
 const jwt = require("jsonwebtoken");
+const { EVENT, logEvent } = require("./auditLog");
 
 const TOKEN_TTL = process.env.JWT_TTL || "12h";
 
@@ -108,6 +109,20 @@ function authMiddleware(req, res, next) {
     return next();
   } catch (error) {
     const expired = error.name === "TokenExpiredError";
+    // Se registra el fin de sesión: una sesión caducada es información de
+    // conexión, y un token manipulado es un intento de acceso que conviene ver.
+    // `decode` no valida la firma, pero sirve para saber de quién era el token.
+    const claims = expired ? jwt.decode(token) : null;
+    logEvent({
+      type: expired ? EVENT.SESSION_EXPIRED : EVENT.SESSION_INVALID,
+      req,
+      username: claims?.sub || null,
+      orgname: claims?.orgname || null,
+      orgId: claims?.orgId || null,
+      role: claims?.role || null,
+      success: false,
+      message: expired ? "La sesión expiró." : "Sesión inválida.",
+    });
     return res.status(401).json({
       success: false,
       message: expired ? "La sesión expiró." : "Sesión inválida.",
@@ -126,6 +141,13 @@ function requireRole(...roles) {
       console.warn(
         `⛔ [Auth] "${req.auth.sub}" (${req.auth.role}) intentó acceder a ${req.method} ${req.path}`,
       );
+      logEvent({
+        type: EVENT.ACCESS_DENIED,
+        req,
+        success: false,
+        message: `Rol "${req.auth.role}" sin permiso sobre ${req.method} ${req.path}`,
+        detail: { rolesRequeridos: roles.join(", ") },
+      });
       return res.status(403).json({
         success: false,
         message: "No tienes permisos para realizar esta acción.",
