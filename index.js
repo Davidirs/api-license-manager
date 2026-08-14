@@ -3155,7 +3155,15 @@ app.get("/api/integrations/whaibot/status", async (req, res) => {
 
 // Enviar un mensaje de prueba de WhatsApp (vía WhaiBot) a los números del cliente.
 // Acepta { to: "<numero>" } o { numbers: ["<numero>", ...] }.
-app.post("/api/integrations/whaibot/send-test", async (req, res) => {
+//
+// Restringido a supervisores y administradores: la notificación por WhatsApp no
+// se libera todavía a los clientes. Además, sin guard de rol este endpoint era
+// un primitivo de "enviar un WhatsApp a un número arbitrario" disponible para
+// cualquier usuario con sesión.
+app.post(
+  "/api/integrations/whaibot/send-test",
+  requireRole("administrator", "supervisor"),
+  async (req, res) => {
   try {
     const { to, numbers } = req.body;
 
@@ -3246,7 +3254,7 @@ app.post("/api/integrations/whaibot/send-test", async (req, res) => {
         : anyOk
           ? "Algunos mensajes no se pudieron enviar."
           : (results[0] && results[0].message) ||
-            "No se pudo enviar el mensaje de prueba.",
+          "No se pudo enviar el mensaje de prueba.",
     });
   } catch (error) {
     console.error("❌ Error en POST /api/integrations/whaibot/send-test:", error);
@@ -3255,8 +3263,9 @@ app.post("/api/integrations/whaibot/send-test", async (req, res) => {
       message: "Error interno al enviar el mensaje de prueba.",
       detail: error.message,
     });
-  }
-});
+    }
+  },
+);
 
 // Endpoint para enviar correos por SMTP
 app.post("/api/sendmail", async (req, res) => {
