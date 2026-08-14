@@ -1,0 +1,23 @@
+name: Deploy to Easypanel
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Easypanel Deploy Webhook (Staging)
+        if: github.ref_name == 'staging'
+        run: |
+          URL="${{ secrets.EASYPANEL_WEBHOOK_STAGING_URL }}"
+          curl -X POST "$URL"
+
+      - name: Trigger Easypanel Deploy Webhook (Main)
+        if: github.ref_name == 'main'
+        run: |
+          URL="${{ secrets.EASYPANEL_WEBHOOK_MAIN_URL }}"
+          curl -X POST "$URL"

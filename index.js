@@ -2,20 +2,86 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const platformClient = require("purecloud-platform-client-v2");
-const { Resend } = require("resend");
 
 const app = express();
 const port = process.env.PORT || 4000;
 
-// Middlewares
+const {
+  signSession,
+  sanitizeUser,
+  sanitizeOrg,
+  authMiddleware,
+  requireAdmin,
+  requireRole,
+  isAuthConfigured,
+} = require("./utils/auth");
+
+// Orígenes permitidos. `origin: true` reflejaba cualquier origen con
+// credentials: true, lo que permitía a cualquier web llamar a la API desde el
+// navegador de un usuario autenticado.
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: true,
+    origin(origin, callback) {
+      // Sin origin: curl, apps móviles, llamadas servidor-a-servidor.
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.length === 0) {
+        // Sin lista configurada se mantiene el comportamiento permisivo previo,
+        // pero avisando: en producción CORS_ORIGINS debe estar definido.
+        console.warn(
+          `⚠️ [CORS] CORS_ORIGINS no configurado; se permite el origen "${origin}". Configúrelo en producción.`,
+        );
+        return callback(null, true);
+      }
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      console.warn(`⛔ [CORS] Origen bloqueado: ${origin}`);
+      const error = new Error("Origen no permitido por CORS");
+      error.code = "CORS_NOT_ALLOWED";
+      return callback(error);
+    },
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-token", "x-genesys-token"],
   }),
 );
+
+/**
+ * Respuesta limpia para los orígenes bloqueados.
+ *
+ * Sin esto, el error del middleware de CORS llega al manejador por defecto de
+ * Express, que devuelve una página HTML con la traza completa y las rutas
+ * absolutas del servidor. Va aquí, inmediatamente después de `cors`, para no
+ * interferir con el resto de errores de la aplicación.
+ */
+app.use((err, req, res, next) => {
+  if (err && err.code === "CORS_NOT_ALLOWED") {
+    return res.status(403).json({
+      success: false,
+      code: "CORS_NOT_ALLOWED",
+      message: "Origen no permitido.",
+    });
+  }
+  return next(err);
+});
+
 app.use(express.json());
+
+// Health check público, útil para el balanceador y para diagnosticar la config.
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    entorno: process.env.ENTORNO || "DEV",
+    authConfigurada: isAuthConfigured(),
+    smtpConfigurado: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER),
+  });
+});
+
+// A partir de aquí toda la API exige sesión. Las excepciones están en
+// PUBLIC_PATHS dentro de utils/auth.js.
+app.use(authMiddleware);
 
 const bcrypt = require("bcryptjs");
 
@@ -29,22 +95,81 @@ const {
 } = require("./utils/emailTemplates");
 
 const { formatTrusteeBilling } = require("./utils/formatTrusteeBilling");
-// Inicializar Resend
-const resend = new Resend(process.env.RESEND_API_KEY);
+const {
+  getEmailSettings,
+  saveEmailSettings,
+} = require("./utils/appSettings");
+// Envío de correo por SMTP (IONOS). Sustituye a Resend.
+const { sendMail, verifyTransport, smtpConfig } = require("./utils/mailer");
+const { fetchOrgToken } = require("./utils/genesysRegions");
+// Registro de conexión y acceso (colección Firestore `accessLogs`).
+const {
+  EVENT,
+  logEvent,
+  queryLogs,
+  purgeOldLogs,
+  RETENTION_DAYS: LOG_RETENTION_DAYS,
+} = require("./utils/auditLog");
+// Bloqueo de notificaciones por entorno (ENTORNO=STAGING).
+const { notificationsBlocked, blockedReason, currentEnv } = require("./utils/environment");
+// Idioma de las plantillas de correo y del análisis de la IA.
+const { normalizeLanguage, SUPPORTED_LANGUAGES } = require("./utils/emailI18n");
+const { promptsFor, languageRule, numbered } = require("./utils/aiPrompts");
+const { languageForRecipients, forgetRecipient } = require("./utils/userLanguage");
 
-// Helper para obtener token internamente
-async function getTokenForRegion(clientId, clientSecret, region) {
-  console.log(clientId, clientSecret, region);
-  const response = await fetch(`http://localhost:${port}/api/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientId, clientSecret, region }),
-  });
-  const data = await response.json();
-  if (data.success) {
-    return data.token;
+/**
+ * Guard para endpoints administrativos que pueden disparar envíos masivos.
+ * Requiere `x-admin-token` igual a MONITOR_ADMIN_TOKEN. Si la variable no está
+ * configurada, el endpoint queda deshabilitado (falla cerrado, no abierto).
+ */
+function requireAdminToken(req, res) {
+  const expected = process.env.MONITOR_ADMIN_TOKEN;
+
+  if (!expected) {
+    res.status(503).json({
+      success: false,
+      message:
+        "Endpoint deshabilitado: configure MONITOR_ADMIN_TOKEN en el entorno para habilitarlo.",
+    });
+    return false;
   }
-  throw new Error(data.error || "Error obteniendo token");
+
+  const provided =
+    req.headers["x-admin-token"] ||
+    (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+
+  if (provided !== expected) {
+    res.status(401).json({ success: false, message: "Token administrativo inválido." });
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Devuelve las preferencias con `language` saneado a uno de los idiomas
+ * soportados (es | en | pt). Un valor inesperado llegado del front no debe
+ * quedar guardado: se caería a español en cada correo sin que nadie lo note.
+ */
+function withNormalizedLanguage(preferences) {
+  const prefs = preferences && typeof preferences === "object" ? { ...preferences } : {};
+  prefs.language = normalizeLanguage(prefs.language);
+  return prefs;
+}
+
+// Helper para obtener token internamente.
+//
+// Antes hacía un fetch HTTP a su propio localhost:/api/token, lo que además de
+// dar una vuelta innecesaria fallaba dentro de Docker y ahora chocaría con el
+// middleware de sesión. Va directo contra el OAuth de Genesys.
+async function getTokenForRegion(clientId, clientSecret, region) {
+  // Nunca registrar clientSecret: los logs del despliegue quedan almacenados y
+  // son visibles para cualquiera con acceso al panel.
+  console.log(
+    `🔑 Solicitando token para clientId=${String(clientId).slice(0, 8)}… región=${region}`,
+  );
+  const { accessToken } = await fetchOrgToken(clientId, clientSecret, region);
+  return accessToken;
 }
 
 // Endpoint de Login
@@ -65,255 +190,14 @@ app.post("/api/login", async (req, res) => {
     const userDoc = await db.collection("users").doc(cleanUsername).get();
 
     if (!userDoc.exists) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Usuario no encontrado." });
-    }
-
-    const userFound = userDoc.data();
-    console.log(
-      `👤 Usuario encontrado: username="${cleanUsername}" | role="${userFound.role}" | orgname="${userFound.orgname}" | thrusted="${userFound.thrusted}"`,
-    );
-
-    // Si no es admin, validar permisos
-    let effectiveThrusted = userFound.thrusted; // Por defecto el del usuario (puede ser array en supervisor)
-
-    if (userFound.role !== "administrator") {
-      let hasAccess = false;
-
-      // Si es supervisor, puede entrar a cualquier organización que pertenezca a su 'thrusted' (puede ser string o array)
-      if (userFound.role === "supervisor") {
-        console.log(
-          `🔍 [Supervisor] Buscando org "${orgname}" con thrusted="${userFound.thrusted}" en colección organizations...`,
-        );
-        let orgQuery = db
-          .collection("organizations")
-          .where("orgname", "==", orgname);
-
-        // Normalizar thrusted: puede ser string simple, string con comas, o array real
-        let thrustedList = [];
-        if (Array.isArray(userFound.thrusted)) {
-          thrustedList = userFound.thrusted;
-        } else if (
-          typeof userFound.thrusted === "string" &&
-          userFound.thrusted.includes(",")
-        ) {
-          thrustedList = userFound.thrusted.split(",").map((s) => s.trim());
-        } else {
-          thrustedList = [userFound.thrusted];
-        }
-
-        if (thrustedList.length > 1) {
-          // Firebase 'in' soporta hasta 10 elementos.
-          orgQuery = orgQuery.where("thrusted", "in", thrustedList);
-        } else {
-          orgQuery = orgQuery.where("thrusted", "==", thrustedList[0]);
-        }
-
-        const orgSnapshot = await orgQuery.get();
-
-        if (!orgSnapshot.empty) {
-          hasAccess = true;
-          effectiveThrusted = orgSnapshot.docs[0].data().thrusted; // Tomamos el thrusted real de la organización
-          console.log(
-            `✅ [Supervisor] Org encontrada: "${orgname}" pertenece al thrusted "${effectiveThrusted}"`,
-          );
-        } else {
-          console.warn(
-            `⚠️ [Supervisor] No se encontró la org "${orgname}" con thrusted="${userFound.thrusted}". Docs encontrados: ${orgSnapshot.size}`,
-          );
-        }
-      }
-
-      // Si es cliente o el supervisor intenta entrar a su propia organización asignada
-      if (!hasAccess && userFound.orgname === orgname) {
-        hasAccess = true;
-        console.log(
-          `✅ [Acceso directo] orgname del usuario ("${userFound.orgname}") coincide con la solicitada ("${orgname}")`,
-        );
-      }
-
-      if (!hasAccess) {
-        console.error(
-          `❌ [Acceso denegado] username="${cleanUsername}" | role="${userFound.role}" | orgname_usuario="${userFound.orgname}" | orgname_solicitada="${orgname}" | thrusted="${userFound.thrusted}"`,
-        );
-        return res.status(401).json({
-          success: false,
-          message:
-            "El usuario no pertenece a la organización especificada o no tiene permisos.",
-        });
-      }
-    } else {
-      console.log(
-        `👑 [Admin] Acceso total concedido a username="${cleanUsername}"`,
-      );
-    }
-
-    // Verificar contraseña
-    console.log(`🔐 Verificando contraseña para "${cleanUsername}"...`);
-    const passwordMatch = await bcrypt.compare(
-      password,
-      userFound.passwordHash,
-    );
-    if (!passwordMatch) {
-      console.error(`❌ [Contraseña incorrecta] username="${cleanUsername}"`);
-      return res
-        .status(401)
-        .json({ success: false, message: "Contraseña incorrecta." });
-    }
-
-    console.log("✅ Login successful for:", { orgname, username });
-
-    let tokens;
-
-    // Obtener la colección credenciales
-    const credsSnapshot = await db.collection("credentials").get();
-    const regionEnvMap = credsSnapshot.docs.map((doc) => doc.data());
-
-    if (userFound.role === "administrator") {
-      console.log(
-        "🔑 Obteniendo tokens para administrador de todas las regiones",
-      );
-      tokens = {};
-
-      const tokenPromises = regionEnvMap.map(async (org) => {
-        console.log(org)
-        const token = await getTokenForRegion(
-          org.clientId,
-          org.clientSecret,
-          org.region,
-        );
-        return { thrusted: org.name, token };
-      });
-
-      const tokenResults = await Promise.all(tokenPromises);
-      tokenResults.forEach(({ thrusted, token }) => {
-        tokens[thrusted] = token;
-      });
-      //console.log("✅ Todos los tokens obtenidos:", Object.keys(tokens));
-      console.log("✅ Todos los tokens obtenidos:", tokens);
-
-    } else {
-      console.log(
-        `🔑 Obteniendo token para región (thrusted efectivo): ${effectiveThrusted}`,
-      );
-
-      // Normalizar effectiveThrusted: puede ser string simple, string con comas, o array
-      let thrustedCandidates = [];
-      if (Array.isArray(effectiveThrusted)) {
-        thrustedCandidates = effectiveThrusted;
-      } else if (
-        typeof effectiveThrusted === "string" &&
-        effectiveThrusted.includes(",")
-      ) {
-        // Ej: "ESMT-DEV,ESMT-DEV-W2" → ["ESMT-DEV", "ESMT-DEV-W2"]
-        thrustedCandidates = effectiveThrusted.split(",").map((s) => s.trim());
-      } else {
-        thrustedCandidates = [effectiveThrusted];
-      }
-
-      console.log(
-        `🔍 Buscando credenciales para candidatos: [${thrustedCandidates.join(", ")}]`,
-      );
-
-      let orgCred = null;
-      for (const candidate of thrustedCandidates) {
-        const found = regionEnvMap.find((cred) => cred.name === candidate);
-        if (found) {
-          orgCred = found;
-          console.log(
-            `✅ Credencial encontrada para candidato: "${candidate}"`,
-          );
-          break;
-        }
-      }
-
-      if (!orgCred) {
-        return res.status(500).json({
-          success: false,
-          message: `No se encontraron credenciales para la región ${effectiveThrusted}`,
-        });
-      }
-      tokens = await getTokenForRegion(
-        orgCred.clientId,
-        orgCred.clientSecret,
-        orgCred.region,
-      );
-      console.log("Token obtenido:", tokens);
-    }
-
-    // Construir el objeto de usuario a devolver al front
-    let userResponse = { ...userFound };
-
-    // Si es supervisor, sobrescribir orgname, orgId, clientId, clientSecret y region
-    // con los datos de la organización a la que está iniciando sesión,
-    // ya que puede navegar en cualquier org hija de su thrusted
-    console.log(
-      `🔎 Buscando org en colección 'organizations' con orgname: '${orgname}'`,
-    );
-    const targetOrgSnapshot = await db
-      .collection("organizations")
-      .where("orgname", "==", orgname)
-      .get();
-
-    if (!targetOrgSnapshot.empty) {
-      const targetOrgDoc = targetOrgSnapshot.docs[0];
-      const targetOrgData = targetOrgDoc.data();
-      // Necesito obtener el token de la org
-      const orgToken = await getTokenForRegion(
-        targetOrgData.clientId,
-        targetOrgData.clientSecret,
-        targetOrgData.region,
-      );
-      userResponse.orgname = orgname;
-      userResponse.orgId = targetOrgData.orgId || targetOrgDoc.id;
-      userResponse.region = targetOrgData.region || userFound.region;
-      userResponse.orgToken = orgToken;
-
-      console.log(
-        `🏢 Org encontrada: ${orgname} | orgId: ${userResponse.orgId} | orgToken generado: ${!!orgToken}`,
-      );
-    } else {
-      console.log(
-        `❌ No se encontró la organización '${orgname}' en la colección 'organizations'. El token no se añadirá.`,
-      );
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "Login exitoso",
-      user: userResponse,
-      token: tokens,
-    });
-  } catch (error) {
-    console.error("Login error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error interno del servidor.",
-      details: error.message,
-    });
-  }
-});
-
-/* 
-backup de login
-app.post("/api/login", async (req, res) => {
-  try {
-    const { orgname, username, password } = req.body;
-    console.log("Login request:", { orgname, username });
-
-    if (!orgname || !username || !password) {
-      return res.status(400).json({
+      logEvent({
+        type: EVENT.LOGIN_USER_NOT_FOUND,
+        req,
+        username: cleanUsername,
+        orgname,
         success: false,
-        message: "orgname, username y password requeridos.",
+        message: "Usuario no encontrado.",
       });
-    }
-
-    // Buscar el usuario en la colección users
-    const cleanUsername = username.trim();
-    const userDoc = await db.collection("users").doc(cleanUsername).get();
-
-    if (!userDoc.exists) {
       return res
         .status(401)
         .json({ success: false, message: "Usuario no encontrado." });
@@ -323,6 +207,27 @@ app.post("/api/login", async (req, res) => {
     console.log(
       `👤 Usuario encontrado: username="${cleanUsername}" | role="${userFound.role}" | orgname="${userFound.orgname}" | thrusted="${userFound.thrusted}"`,
     );
+
+    // Validar si el usuario está desactivado (active === false).
+    // Los usuarios legados sin el campo 'active' se consideran activos.
+    if (userFound.active === false) {
+      console.warn(`🚫 [Usuario desactivado] username="${cleanUsername}"`);
+      logEvent({
+        type: EVENT.LOGIN_USER_DISABLED,
+        req,
+        username: cleanUsername,
+        orgname,
+        role: userFound.role,
+        success: false,
+        message: "El usuario está desactivado.",
+      });
+      return res.status(403).json({
+        success: false,
+        code: "USER_DISABLED",
+        message:
+          "Tu usuario está desactivado. Por favor, comunícate con el proveedor.",
+      });
+    }
 
     // Si no es admin, validar permisos
     let effectiveThrusted = userFound.thrusted; // Por defecto el del usuario (puede ser array en supervisor)
@@ -386,6 +291,16 @@ app.post("/api/login", async (req, res) => {
         console.error(
           `❌ [Acceso denegado] username="${cleanUsername}" | role="${userFound.role}" | orgname_usuario="${userFound.orgname}" | orgname_solicitada="${orgname}" | thrusted="${userFound.thrusted}"`,
         );
+        logEvent({
+          type: EVENT.LOGIN_NO_ACCESS,
+          req,
+          username: cleanUsername,
+          orgname,
+          role: userFound.role,
+          success: false,
+          message: "El usuario no pertenece a la organización solicitada.",
+          detail: { orgnameUsuario: userFound.orgname },
+        });
         return res.status(401).json({
           success: false,
           message:
@@ -398,6 +313,38 @@ app.post("/api/login", async (req, res) => {
       );
     }
 
+    // Validar si la organización está desactivada.
+    // Solo aplica a usuarios "client": los administradores y los supervisores
+    // pueden iniciar sesión aunque la organización esté desactivada.
+    // Las organizaciones legadas sin el campo 'active' se consideran activas.
+    if (!["administrator", "supervisor"].includes(userFound.role)) {
+      const orgActiveSnapshot = await db
+        .collection("organizations")
+        .where("orgname", "==", orgname)
+        .get();
+      if (
+        !orgActiveSnapshot.empty &&
+        orgActiveSnapshot.docs[0].data().active === false
+      ) {
+        console.warn(`🚫 [Organización desactivada] orgname="${orgname}"`);
+        logEvent({
+          type: EVENT.LOGIN_ORG_DISABLED,
+          req,
+          username: cleanUsername,
+          orgname,
+          orgId: orgActiveSnapshot.docs[0].id,
+          role: userFound.role,
+          success: false,
+          message: "La organización está desactivada.",
+        });
+        return res.status(403).json({
+          success: false,
+          code: "ORG_DISABLED",
+          message: `La organización "${orgname}" está desactivada. Por favor, comunícate con el proveedor.`,
+        });
+      }
+    }
+
     // Verificar contraseña
     console.log(`🔐 Verificando contraseña para "${cleanUsername}"...`);
     const passwordMatch = await bcrypt.compare(
@@ -406,6 +353,15 @@ app.post("/api/login", async (req, res) => {
     );
     if (!passwordMatch) {
       console.error(`❌ [Contraseña incorrecta] username="${cleanUsername}"`);
+      logEvent({
+        type: EVENT.LOGIN_FAILED,
+        req,
+        username: cleanUsername,
+        orgname,
+        role: userFound.role,
+        success: false,
+        message: "Contraseña incorrecta.",
+      });
       return res
         .status(401)
         .json({ success: false, message: "Contraseña incorrecta." });
@@ -426,6 +382,8 @@ app.post("/api/login", async (req, res) => {
       tokens = {};
 
       const tokenPromises = regionEnvMap.map(async (org) => {
+        // `org` contiene clientSecret: sólo se registra su nombre.
+        console.log(`  · credencial: ${org.name} (${org.region})`);
         const token = await getTokenForRegion(
           org.clientId,
           org.clientSecret,
@@ -439,6 +397,7 @@ app.post("/api/login", async (req, res) => {
         tokens[thrusted] = token;
       });
       console.log("✅ Todos los tokens obtenidos:", Object.keys(tokens));
+
     } else {
       console.log(
         `🔑 Obteniendo token para región (thrusted efectivo): ${effectiveThrusted}`,
@@ -488,12 +447,15 @@ app.post("/api/login", async (req, res) => {
       console.log("Token obtenido:", tokens);
     }
 
-    // Construir el objeto de usuario a devolver al front
-    let userResponse = { ...userFound };
+    // Construir el objeto de usuario a devolver al front.
+    // sanitizeUser elimina passwordHash, clientId y clientSecret: antes se
+    // devolvía el documento completo y el navegador acababa guardando el hash
+    // de la contraseña y las credenciales OAuth de Genesys en sessionStorage.
+    let userResponse = sanitizeUser(userFound);
 
-    // Si es supervisor, sobrescribir orgname, orgId, clientId, clientSecret y region
-    // con los datos de la organización a la que está iniciando sesión,
-    // ya que puede navegar en cualquier org hija de su thrusted
+    // Si es supervisor, sobrescribir orgname, orgId y region con los datos de
+    // la organización a la que está iniciando sesión, ya que puede navegar en
+    // cualquier org hija.
     console.log(
       `🔎 Buscando org en colección 'organizations' con orgname: '${orgname}'`,
     );
@@ -505,7 +467,9 @@ app.post("/api/login", async (req, res) => {
     if (!targetOrgSnapshot.empty) {
       const targetOrgDoc = targetOrgSnapshot.docs[0];
       const targetOrgData = targetOrgDoc.data();
-      // Necesito obtener el token de la org
+      // El token de Genesys sí viaja al front: es lo que usa el dashboard para
+      // consultar la API de Genesys. Es de vida corta y alcance limitado, a
+      // diferencia del clientSecret que lo genera.
       const orgToken = await getTokenForRegion(
         targetOrgData.clientId,
         targetOrgData.clientSecret,
@@ -525,22 +489,66 @@ app.post("/api/login", async (req, res) => {
       );
     }
 
+    // JWT de sesión: es lo que autentica al usuario contra nuestra propia API.
+    const sessionToken = signSession({
+      username: cleanUsername,
+      role: userFound.role,
+      orgname: userResponse.orgname || userFound.orgname,
+      orgId: userResponse.orgId,
+    });
+
+    logEvent({
+      type: EVENT.LOGIN_SUCCESS,
+      req,
+      username: cleanUsername,
+      orgname: userResponse.orgname || userFound.orgname,
+      orgId: userResponse.orgId,
+      role: userFound.role,
+      success: true,
+      message: "Inicio de sesión correcto.",
+      detail: { language: userFound.preferences?.language || null },
+    });
+
     return res.status(200).json({
       success: true,
       message: "Login exitoso",
       user: userResponse,
+      sessionToken,
       token: tokens,
     });
   } catch (error) {
     console.error("Login error:", error);
+    logEvent({
+      type: EVENT.LOGIN_ERROR,
+      req,
+      username: req.body?.username,
+      orgname: req.body?.orgname,
+      success: false,
+      message: error.message,
+    });
     return res.status(500).json({
       success: false,
       message: "Error interno del servidor.",
       details: error.message,
     });
   }
-}); */
-app.post("/api/token", async (req, res) => {
+});
+
+/**
+ * Cierre de sesión. No invalida el JWT (es sin estado y de vida corta): existe
+ * para dejar constancia en el log de cuándo terminó cada sesión.
+ */
+app.post("/api/logout", (req, res) => {
+  logEvent({
+    type: EVENT.LOGOUT,
+    req,
+    success: true,
+    message: "Cierre de sesión.",
+  });
+  return res.status(200).json({ success: true, message: "Sesión cerrada." });
+});
+
+app.post("/api/token", requireAdmin, async (req, res) => {
   try {
     const { clientId, clientSecret, region } = req.body;
     //console.log("region", region);
@@ -631,6 +639,8 @@ app.post("/api/token", async (req, res) => {
 });
 
 const { initCron, runDailyMonitor } = require("./services/cronOrchestrator");
+const { getMonitorHealth } = require("./services/monitorQueue");
+const { getQueueHealth } = require("./services/emailQueue");
 
 // Iniciar el servidor
 app.listen(port, () => {
@@ -638,16 +648,59 @@ app.listen(port, () => {
   initCron();
 });
 
-// Endpoint de prueba para forzar el orquestador
-app.get("/api/test-cron", async (req, res) => {
-  console.log("Forzando ejecución del Cron desde endpoint de prueba...");
-  // Lo ejecutamos asíncronamente en background para no bloquear el request
-  runDailyMonitor().catch((err) => console.error(err));
+// Disparo manual del orquestador. Protegido: sin el guard, cualquiera con la
+// URL podía lanzar un envío masivo de correos a todos los clientes.
+app.post("/api/monitor/run", async (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+
+  console.log("▶️ Forzando ejecución del monitor desde endpoint administrativo...");
+  logEvent({
+    type: EVENT.MONITOR_RUN,
+    req,
+    message: "Ejecución manual del orquestador de monitoreo.",
+    detail: { entorno: currentEnv(), notificacionesBloqueadas: notificationsBlocked() },
+  });
+  runDailyMonitor().catch((err) =>
+    console.error("❌ Ejecución manual del monitor falló:", err.message),
+  );
   return res.json({
     success: true,
-    message:
-      "El orquestador de cron se inició en background. Revisa la consola.",
+    message: "El orquestador se inició en background. Revisa la consola.",
   });
+});
+
+// Salud del monitoreo: estado de las colas y organizaciones con último error.
+app.get("/api/monitor/health", async (req, res) => {
+  if (!requireAdminToken(req, res)) return;
+
+  try {
+    const [monitor, emails] = await Promise.all([getMonitorHealth(), getQueueHealth()]);
+
+    const orgsSnapshot = await db.collection("organizations").get();
+    const conProblemas = [];
+    orgsSnapshot.forEach((doc) => {
+      const data = doc.data();
+      if (data.monitorState?.lastError) {
+        conProblemas.push({
+          orgId: data.orgId || doc.id,
+          orgname: data.orgname,
+          error: data.monitorState.lastError,
+          lastRunAt: data.monitorState.lastRunAt || null,
+        });
+      }
+    });
+
+    return res.json({
+      success: true,
+      queues: { monitor, emails },
+      organizacionesConError: conProblemas,
+    });
+  } catch (error) {
+    console.error("❌ Error en /api/monitor/health:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error interno", detail: error.message });
+  }
 });
 
 // Endpoint para obtener Trustee Billing Overview
@@ -813,6 +866,8 @@ app.post("/api/subscriptionoverview", async (req, res) => {
 
     // Convertir a timestamp en milisegundos o resolver palabras clave "current" / "previous"
     let timestamp;
+    // Fechas reales del periodo, cuando se resuelven desde /billing/periods.
+    let periodOverride = null;
     if (actualEndDate === "current") {
       timestamp = Date.now();
     } else if (actualEndDate === "previous") {
@@ -841,28 +896,38 @@ app.post("/api/subscriptionoverview", async (req, res) => {
       const periodsData = await periodsResponse.json();
       const periods = periodsData.entities || periodsData.periods || periodsData || [];
 
-      if (!Array.isArray(periods) || periods.length < 2) {
+      if (!Array.isArray(periods) || periods.length === 0) {
         return res.status(500).json({
           success: false,
-          error: "No se encontraron suficientes periodos de facturación para determinar el periodo anterior.",
+          error: "No se encontraron periodos de facturación para determinar el periodo anterior.",
         });
       }
 
       // Ordenar de más reciente a más antiguo por startDate
       periods.sort((a, b) => new Date(b.startDate) - new Date(a.startDate));
 
-      // El periodo anterior es el segundo en la lista (índice 1)
-      const previousPeriod = periods[1];
-      if (!previousPeriod || !previousPeriod.startDate) {
+      // El "periodo anterior" es el más reciente YA FINALIZADO, no el índice 1.
+      // Genesys tarda días en rotar el periodo vigente: durante esa ventana
+      // periods[0] es el periodo recién cerrado y periods[1] sería uno de más,
+      // devolviendo datos de dos meses atrás.
+      const now = new Date();
+      const hoyUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      const previousPeriod = periods.find((p) => {
+        const end = new Date(p.endDate);
+        if (isNaN(end.getTime())) return false;
+        return Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()) < hoyUTC;
+      });
+
+      if (!previousPeriod || !previousPeriod.endDate) {
         return res.status(500).json({
           success: false,
-          error: "No se pudo determinar el periodo anterior de facturación.",
+          error: "No se encontró ningún periodo de facturación ya finalizado.",
         });
       }
 
-      // Usar una fecha dentro del periodo anterior (su startDate + 1 día)
-      const previousStart = new Date(previousPeriod.startDate);
-      timestamp = previousStart.getTime() + 24 * 60 * 60 * 1000;
+      // La fecha de fin del periodo cerrado identifica el periodo sin ambigüedad.
+      timestamp = new Date(previousPeriod.endDate).getTime();
+      periodOverride = previousPeriod;
     } else if (isNaN(actualEndDate)) {
       const parsedDate = new Date(actualEndDate).getTime();
       if (isNaN(parsedDate)) {
@@ -916,13 +981,19 @@ app.post("/api/subscriptionoverview", async (req, res) => {
 
     const data = await overviewRes.json();
 
-    // Enriquecer con fechas
-    const endDateObj = new Date(timestamp);
-    data.billingPeriodEndDate = endDateObj.toISOString();
+    // Enriquecer con fechas. Si conocemos el periodo real (vía /billing/periods)
+    // usamos sus fechas exactas; si no, se aproxima restando un mes.
+    if (periodOverride && periodOverride.startDate && periodOverride.endDate) {
+      data.billingPeriodStartDate = new Date(periodOverride.startDate).toISOString();
+      data.billingPeriodEndDate = new Date(periodOverride.endDate).toISOString();
+    } else {
+      const endDateObj = new Date(timestamp);
+      data.billingPeriodEndDate = endDateObj.toISOString();
 
-    const startDateObj = new Date(timestamp);
-    startDateObj.setUTCMonth(startDateObj.getUTCMonth() - 1);
-    data.billingPeriodStartDate = startDateObj.toISOString();
+      const startDateObj = new Date(timestamp);
+      startDateObj.setUTCMonth(startDateObj.getUTCMonth() - 1);
+      data.billingPeriodStartDate = startDateObj.toISOString();
+    }
 
     data.rampPeriodStartDate = data.rampPeriodStartingTimestamp || data.billingPeriodStartDate;
     data.rampPeriodEndDate = data.rampPeriodEndingTimestamp || data.billingPeriodEndDate;
@@ -1926,7 +1997,7 @@ app.get("/api/reports/ia-tokens-daily", async (req, res) => {
 // Endpoint para analizar métricas con IA (usando Groq API y API Key del Servidor)
 app.post("/api/analyze-metrics", async (req, res) => {
   try {
-    const { clientData, dailyLogins, outboundAttempts, overageDetailsText, languageName } = req.body;
+    const { clientData, dailyLogins, outboundAttempts, overageDetailsText, lang, languageName } = req.body;
 
     const groqApiKey = process.env.GROQ_API_KEY;
 
@@ -1937,31 +2008,42 @@ app.post("/api/analyze-metrics", async (req, res) => {
       });
     }
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas en ${languageName || 'español'}. 
+    // El idioma se resuelve en el backend, no se toma tal cual del cliente:
+    // antes llegaba una cadena libre y bastaba una clave de traducción sin
+    // traducir para que el modelo recibiera un idioma inexistente y respondiera
+    // en cualquier lengua. `promptsFor`/`languageRule` sanean el valor y caen a
+    // español ante cualquier cosa que no reconozcan.
+    const idiomaAnalisis = lang || languageName;
+    const p = promptsFor(idiomaAnalisis);
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas.
+
+${languageRule(idiomaAnalisis)}
 
 REGLAS DE FORMATO OBLIGATORIAS:
 1. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto del análisis.
 2. Para las listas y puntos, utiliza "1.- " para números o "- " para viñetas, nunca uses "*".
 3. En la sección de Recomendaciones, debes sugerir explícitamente que a través de la opción de "Último Login" (en Conexiones Diarias) el administrador puede detectar usuarios inactivos que no han iniciado sesión en los últimos meses. Recomienda desactivar estas cuentas en la organización de Genesys Cloud para evitar que por algún motivo inicien sesión por error y consuman licencias innecesarias de la organización.
-4. Si se proporciona información de sobreuso de licencias y el detalle de los últimos usuarios que iniciaron sesión, menciónalos en el análisis indicando quiénes fueron los últimos usuarios que registraron actividad y causaron el sobreuso.`;
+4. Si se proporciona información de sobreuso de licencias, analízala indicando en qué licencias se excedió el compromiso y en cuánto, y qué implica ese exceso.
+5. Los datos que recibes son agregados y NO incluyen identidades de agentes. No inventes ni menciones nombres, correos, divisiones ni fechas de inicio de sesión de personas concretas: si el análisis requiere ese detalle, remite al reporte de "Último Login" del panel.`;
 
-    const userPrompt = `Analiza las siguientes métricas de Genesys Cloud y proporciona:
-1. Resumen ejecutivo de uso
-2. Estado de KPIs principales (licencias, recursos, storage, IA tokens y Outbound attempts)
-3. Alertas (si hay sobre-uso)
-4. Recomendaciones específicas para optimización
+    // Los encabezados van ya en el idioma de salida: si se piden en español, el
+    // modelo los copia literalmente y devuelve títulos en español dentro de un
+    // análisis en otro idioma.
+    const userPrompt = `${p.metricsIntro}
+${numbered(p.metricsSections)}
 
-Datos de licencias y uso general:
+${p.metricsLicenses}
 ${JSON.stringify(clientData, null, 2)}
 
-Resumen de conexiones diarias:
+${p.metricsLogins}
 ${JSON.stringify(dailyLogins, null, 2)}
 
-Resumen de intentos outbound y campañas:
+${p.metricsOutbound}
 ${JSON.stringify(outboundAttempts, null, 2)}
 
-Detalles de sobreuso y últimos inicios de sesión:
-${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
+${p.metricsOverage}
+${overageDetailsText || p.metricsNoOverage}`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -1986,7 +2068,14 @@ ${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
     }
 
     const data = await response.json();
-    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+    // Si el modelo no devuelve nada se responde con un código, no con un texto:
+    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
+    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
+    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
+    const aiText = data.choices[0]?.message?.content;
+    if (!aiText) {
+      return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
+    }
 
     return res.status(200).json({
       success: true,
@@ -2002,7 +2091,7 @@ ${overageDetailsText || "No hay sobreuso de licencias detectado."}`;
 // Endpoint para analizar comparativa entre periodos con IA
 app.post("/api/analyze-comparison", async (req, res) => {
   try {
-    const { kpiData, selectedCategories, kpiName, languageName } = req.body;
+    const { kpiData, selectedCategories, kpiName, lang, languageName } = req.body;
 
     const groqApiKey = process.env.GROQ_API_KEY;
     if (!groqApiKey) {
@@ -2012,7 +2101,12 @@ app.post("/api/analyze-comparison", async (req, res) => {
       });
     }
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX especializado en análisis comparativo entre periodos de facturación. Analiza los datos proporcionados y genera un análisis detallado en ${languageName || 'español'}.
+    const idiomaAnalisis = lang || languageName;
+    const p = promptsFor(idiomaAnalisis);
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX especializado en análisis comparativo entre periodos de facturación. Analiza los datos proporcionados y genera un análisis detallado.
+
+${languageRule(idiomaAnalisis)}
 
 REGLAS DE FORMATO OBLIGATORIAS:
 1. No uses negritas (**texto**) en ningún lugar.
@@ -2025,20 +2119,17 @@ Para cada KPI analizado, debes:
 3. Proporcionar contexto sobre si los cambios son normales o requieren atención
 4. Dar recomendaciones específicas basadas en las tendencias observadas`;
 
-    const userPrompt = `Analiza la siguiente comparativa de métricas de Genesys Cloud entre periodos de facturación:
+    const userPrompt = `${p.comparisonIntro}
 
-Categorías seleccionadas: ${selectedCategories.join(", ")}
+${p.comparisonCategories} ${(selectedCategories || []).join(", ")}
 
-Datos de KPIs por periodo:
+${p.comparisonData}
 ${JSON.stringify(kpiData, null, 2)}
 
-${kpiName ? `Enfócate especialmente en el KPI: "${kpiName}"` : "Proporciona un análisis general de todos los KPIs."}
+${kpiName ? p.comparisonFocus.replace("{{kpi}}", kpiName) : p.comparisonGeneral}
 
-Para cada KPI, incluye:
-- Comparación numérica entre periodos
-- Variación porcentual
-- Tendencia
-- Recomendaciones`;
+${p.comparisonEach}
+${p.comparisonSections.map((s) => `- ${s}`).join("\n")}`;
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -2063,7 +2154,14 @@ Para cada KPI, incluye:
     }
 
     const data = await response.json();
-    const aiText = data.choices[0]?.message?.content || 'No se pudo obtener respuesta';
+    // Si el modelo no devuelve nada se responde con un código, no con un texto:
+    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
+    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
+    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
+    const aiText = data.choices[0]?.message?.content;
+    if (!aiText) {
+      return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
+    }
 
     return res.status(200).json({
       success: true,
@@ -2261,25 +2359,46 @@ app.get("/api/reports/last-login", async (req, res) => {
 app.get("/api/setuser", async (req, res) => {
   try {
     const { username, orgname } = req.query;
+    const isAdmin = req.auth?.role === "administrator";
 
-    // Si consultan uno específico
+    // Si consultan uno específico: administrador, o el propio usuario.
     if (username && orgname) {
-      const userDoc = await db.collection("users").doc(username.trim()).get();
+      const cleanUsername = username.trim();
+      if (!isAdmin && req.auth?.sub !== cleanUsername) {
+        return res.status(403).json({
+          success: false,
+          message: "Sólo puedes consultar tu propio perfil.",
+        });
+      }
+      const userDoc = await db.collection("users").doc(cleanUsername).get();
       if (!userDoc.exists) {
         return res.status(404).json({ message: "Usuario no encontrado." });
       }
-      return res.status(200).json(userDoc.data());
+      return res.status(200).json(sanitizeUser(userDoc.data()));
     }
 
-    // Si no se envían parámetros, lista todos los usuarios mapeados en formato de organizaciones (como lo hacía DynamoDB)
+    // El listado completo (todas las organizaciones y usuarios) es sólo para
+    // administradores: es el que expone la nómina entera de clientes.
+    if (!isAdmin) {
+      console.warn(
+        `⛔ [Auth] "${req.auth?.sub}" (${req.auth?.role}) intentó listar todos los usuarios`,
+      );
+      return res.status(403).json({
+        success: false,
+        message: "No tienes permisos para listar usuarios.",
+      });
+    }
+
+    // Lista todos los usuarios mapeados en formato de organizaciones (como lo hacía DynamoDB)
     const orgsSnapshot = await db.collection("organizations").get();
     const usersSnapshot = await db.collection("users").get();
 
-    let orgsList = orgsSnapshot.docs.map((doc) => ({
-      ...doc.data(),
-      orgId: doc.id,
-      users: [],
-    }));
+    // sanitizeOrg quita clientId/clientSecret: este endpoint devolvía las
+    // credenciales OAuth de Genesys de TODAS las organizaciones. Se conserva
+    // `hasCredentials` para que la UI pueda indicar si están configuradas.
+    let orgsList = orgsSnapshot.docs.map((doc) =>
+      sanitizeOrg({ ...doc.data(), orgId: doc.id, users: [] }),
+    );
     let usersList = usersSnapshot.docs.map((doc) => doc.data());
 
     // Mapear usuarios dentro de sus organizaciones correspondientes
@@ -2295,15 +2414,17 @@ app.get("/api/setuser", async (req, res) => {
           region: u.region || "us-east-1",
           thrusted: u.thrusted || "N/A",
           criticalMetrics: [],
+          active: true,
+          hasCredentials: false,
           users: [],
         };
         orgsList.push(org);
       }
-      // Agregamos el usuario con el formato exacto que espera el frontend / settings
+      // Agregamos el usuario con el formato que espera el frontend / settings,
+      // sin passwordHash ni credenciales.
       org.users.push({
         username: u.username,
-        passwordHash: u.passwordHash,
-        user: u, // Todo el detalle dentro de la propiedad 'user'
+        user: sanitizeUser(u),
       });
     });
 
@@ -2314,6 +2435,12 @@ app.get("/api/setuser", async (req, res) => {
   }
 });
 
+// Crear o actualizar usuarios.
+//
+// No lleva `requireAdmin` global: cualquier usuario debe poder guardar SUS
+// propias preferencias de notificación desde /settings. La autorización es por
+// fila — administrador para todo, el resto sólo sobre sí mismo y con una lista
+// blanca de campos, para que nadie pueda ascenderse a administrador.
 app.post("/api/setuser", async (req, res) => {
   try {
     const body = req.body;
@@ -2328,8 +2455,28 @@ app.post("/api/setuser", async (req, res) => {
     }
 
     const cleanUsername = userToCreate.username.trim();
+    const isAdmin = req.auth?.role === "administrator";
+    const isSelf = req.auth?.sub === cleanUsername;
+
+    if (!isAdmin && !isSelf) {
+      console.warn(
+        `⛔ [Auth] "${req.auth?.sub}" (${req.auth?.role}) intentó modificar a "${cleanUsername}"`,
+      );
+      return res.status(403).json({
+        success: false,
+        message: "Sólo puedes modificar tu propio perfil.",
+      });
+    }
+
     const userRef = db.collection("users").doc(cleanUsername);
     const userDoc = await userRef.get();
+
+    if (!isAdmin && (mode !== "update" || !userDoc.exists)) {
+      return res.status(403).json({
+        success: false,
+        message: "No tienes permisos para crear usuarios.",
+      });
+    }
 
     const orgId = body.orgId || userToCreate.orgId || orgname;
     const orgRef = db.collection("organizations").doc(orgId);
@@ -2356,6 +2503,8 @@ app.post("/api/setuser", async (req, res) => {
             clientId: body.clientId || userToCreate.clientId || "",
             clientSecret: body.clientSecret || userToCreate.clientSecret || "",
             criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
+            // Preservar el estado 'active' existente; por defecto activa.
+            active: orgDoc.exists ? orgDoc.data().active ?? true : true,
           },
           { merge: true },
         );
@@ -2372,38 +2521,102 @@ app.post("/api/setuser", async (req, res) => {
         clientId: userToCreate.clientId || body.clientId || (orgDoc.exists ? orgDoc.data().clientId : "") || "",
         clientSecret: userToCreate.clientSecret || body.clientSecret || (orgDoc.exists ? orgDoc.data().clientSecret : "") || "",
         region: userToCreate.region || body.region || (orgDoc.exists ? orgDoc.data().region : "us-east-1") || "us-east-1",
-        preferences: userToCreate.preferences || {},
+        // El idioma se elige al crear el usuario y decide en qué idioma se le
+        // renderizan la interfaz y las plantillas de correo. Sin selección,
+        // español.
+        preferences: withNormalizedLanguage(userToCreate.preferences),
+        // Los usuarios nuevos se crean activos por defecto.
+        active: true,
       };
       await userRef.set(firestoreUser);
+      forgetRecipient(cleanUsername);
+
+      logEvent({
+        type: EVENT.USER_CREATED,
+        req,
+        target: cleanUsername,
+        orgname,
+        orgId,
+        message: `Usuario "${cleanUsername}" creado.`,
+        detail: {
+          rol: firestoreUser.role,
+          idioma: firestoreUser.preferences.language,
+        },
+      });
 
       return res.status(201).json({
         success: true,
         message: `Usuario ${cleanUsername} creado exitosamente.`,
       });
     } else {
-      // Update: solo guardamos los campos seguros del usuario.
-      // orgId, orgToken, region y criticalMetrics se gestionan a nivel de organización
-      // y NO deben sobreescribirse desde el perfil del usuario.
-      const {
-        orgId: _orgId,
-        orgToken: _orgToken,
-        region: _region,
-        criticalMetrics: _criticalMetrics,
-        password: _password,
-        ...safeUserFields
-      } = userToCreate;
+      let updates;
 
-      const updates = { ...safeUserFields, orgname };
-      if (orgId) {
-        updates.orgId = orgId;
+      if (isAdmin) {
+        // Update de administrador: se guardan los campos seguros del usuario.
+        // orgId, orgToken, region y criticalMetrics se gestionan a nivel de
+        // organización y NO deben sobreescribirse desde el perfil del usuario.
+        const {
+          orgId: _orgId,
+          orgToken: _orgToken,
+          region: _region,
+          criticalMetrics: _criticalMetrics,
+          password: _password,
+          ...safeUserFields
+        } = userToCreate;
+
+        updates = { ...safeUserFields, orgname };
+        if (safeUserFields.preferences && typeof safeUserFields.preferences === "object") {
+          updates.preferences = withNormalizedLanguage(safeUserFields.preferences);
+        }
+        if (orgId) {
+          updates.orgId = orgId;
+        }
+      } else {
+        // Autoedición: lista blanca estricta. El front manda el objeto de
+        // usuario completo desde sessionStorage, que incluye `role`, `active`
+        // y `orgname`; copiarlo tal cual permitiría ascenderse a administrador
+        // o reactivarse tras ser dado de baja.
+        updates = {};
+        if (userToCreate.preferences && typeof userToCreate.preferences === "object") {
+          updates.preferences = withNormalizedLanguage(userToCreate.preferences);
+        }
       }
 
-      // Si el usuario provee una nueva contraseña (no vacía)
-      if (userData.password && userData.password.trim() !== "") {
-        updates.passwordHash = await bcrypt.hash(userData.password, 10);
+      // Nueva contraseña. Se acepta tanto dentro de `user` como en la raíz del
+      // cuerpo: el cambio de contraseña del perfil la envía en la raíz.
+      const newPassword = userData.password || body.password;
+      if (newPassword && String(newPassword).trim() !== "") {
+        updates.passwordHash = await bcrypt.hash(String(newPassword), 10);
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return res
+          .status(400)
+          .json({ success: false, message: "No hay cambios que guardar." });
       }
 
       await userRef.set(updates, { merge: true });
+      // La caché de idiomas quedaría sirviendo el anterior hasta que expire.
+      forgetRecipient(cleanUsername);
+
+      logEvent({
+        type: EVENT.USER_UPDATED,
+        req,
+        target: cleanUsername,
+        orgname,
+        orgId,
+        message: isSelf
+          ? "Actualización del propio perfil."
+          : `El administrador actualizó a "${cleanUsername}".`,
+        detail: {
+          // Nunca el valor, sólo qué se tocó: el hash de la contraseña no debe
+          // acabar en un log que se muestra en pantalla.
+          campos: Object.keys(updates)
+            .map((k) => (k === "passwordHash" ? "contraseña" : k))
+            .join(", "),
+          idioma: updates.preferences?.language || null,
+        },
+      });
 
       return res
         .status(200)
@@ -2419,10 +2632,11 @@ app.post("/api/setuser", async (req, res) => {
   }
 });
 
-app.post("/api/organization", async (req, res) => {
+app.post("/api/organization", requireAdmin, async (req, res) => {
   try {
     const body = req.body;
-    const { orgId, orgname, thrusted, region, clientId, clientSecret } = body;
+    const { orgId, orgname, thrusted, region, clientId, clientSecret, active } =
+      body;
 
     if (!orgId || !orgname) {
       return res.status(400).json({
@@ -2435,6 +2649,15 @@ app.post("/api/organization", async (req, res) => {
     const orgRef = db.collection("organizations").doc(cleanOrgId);
     const orgDoc = await orgRef.get();
 
+    // Determinar el estado 'active': si viene explícito en el body se usa,
+    // si no, se preserva el existente y por defecto la org queda activa.
+    const resolvedActive =
+      typeof active === "boolean"
+        ? active
+        : orgDoc.exists
+          ? orgDoc.data().active ?? true
+          : true;
+
     await orgRef.set(
       {
         orgId: cleanOrgId,
@@ -2444,9 +2667,20 @@ app.post("/api/organization", async (req, res) => {
         clientId: clientId || "",
         clientSecret: clientSecret || "",
         criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
+        active: resolvedActive,
       },
       { merge: true },
     );
+
+    logEvent({
+      type: orgDoc.exists ? EVENT.ORG_UPDATED : EVENT.ORG_CREATED,
+      req,
+      target: cleanOrgId,
+      orgname: orgname.trim(),
+      orgId: cleanOrgId,
+      message: `Organización "${orgname.trim()}" ${orgDoc.exists ? "actualizada" : "creada"}.`,
+      detail: { region: region || "us-east-1", thrusted: thrusted || "N/A", active: resolvedActive },
+    });
 
     return res.status(200).json({
       success: true,
@@ -2462,14 +2696,572 @@ app.post("/api/organization", async (req, res) => {
   }
 });
 
-// Endpoint para enviar correos usando Resend
-app.post("/api/sendmail", async (req, res) => {
-  let { to, subject, message, templateType, templateData, isNotification } =
-    req.body;
+// Activar / Desactivar una organización.
+// Cuando active === false, los usuarios no administradores no podrán iniciar
+// sesión en esa organización (ver /api/login).
+app.post("/api/organization/status", requireAdmin, async (req, res) => {
+  try {
+    const { orgId, active } = req.body;
 
-  // Establece el remitente fijo
-  const fromEmail =
-    "License Manager <notificaciones@genesys-metrics.cambialapp.com>";
+    if (!orgId || typeof active !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "orgId y active (boolean) son requeridos.",
+      });
+    }
+
+    const orgRef = db.collection("organizations").doc(orgId.trim());
+    const orgDoc = await orgRef.get();
+
+    if (!orgDoc.exists) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Organización no encontrada." });
+    }
+
+    await orgRef.set({ active }, { merge: true });
+
+    console.log(
+      `🔁 [Org ${active ? "activada" : "desactivada"}] orgId="${orgId}"`,
+    );
+
+    logEvent({
+      type: EVENT.ORG_STATUS_CHANGED,
+      req,
+      target: orgId.trim(),
+      orgname: orgDoc.data().orgname || null,
+      orgId: orgId.trim(),
+      message: `Organización ${active ? "activada" : "desactivada"}.`,
+      detail: { active },
+    });
+
+    return res.status(200).json({
+      success: true,
+      active,
+      message: `Organización ${active ? "activada" : "desactivada"} exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/organization/status:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      detail: error.message,
+    });
+  }
+});
+
+// Activar / Desactivar un usuario.
+// Cuando active === false, el usuario no podrá iniciar sesión (ver /api/login).
+app.post("/api/user/status", requireAdmin, async (req, res) => {
+  try {
+    const { username, active } = req.body;
+
+    if (!username || typeof active !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "username y active (boolean) son requeridos.",
+      });
+    }
+
+    const userRef = db.collection("users").doc(username.trim());
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Usuario no encontrado." });
+    }
+
+    await userRef.set({ active }, { merge: true });
+
+    console.log(
+      `🔁 [Usuario ${active ? "activado" : "desactivado"}] username="${username}"`,
+    );
+
+    logEvent({
+      type: EVENT.USER_STATUS_CHANGED,
+      req,
+      target: username.trim(),
+      orgname: userDoc.data().orgname || null,
+      orgId: userDoc.data().orgId || null,
+      message: `Usuario ${active ? "activado" : "desactivado"}.`,
+      detail: { active },
+    });
+
+    return res.status(200).json({
+      success: true,
+      active,
+      message: `Usuario ${active ? "activado" : "desactivado"} exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/user/status:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      detail: error.message,
+    });
+  }
+});
+
+// ==================== Logs de conexión y acceso (admin) ====================
+// Los registros los escribe utils/auditLog.js desde el login, el middleware de
+// sesión y cada acción sensible. Aquí sólo se consultan.
+
+app.get("/api/logs", requireAdmin, async (req, res) => {
+  try {
+    const { from, to, type, category, username, orgname, success, limit, cursor } =
+      req.query;
+
+    const parseTimestamp = (value, endOfDay = false) => {
+      if (!value) return null;
+      // Se aceptan epoch en milisegundos y fechas ISO ("2026-08-12").
+      if (/^\d+$/.test(String(value))) return Number(value);
+      const date = new Date(String(value));
+      if (Number.isNaN(date.getTime())) return null;
+      if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
+        date.setUTCHours(23, 59, 59, 999);
+      }
+      return date.getTime();
+    };
+
+    const result = await queryLogs({
+      from: parseTimestamp(from),
+      to: parseTimestamp(to, true),
+      type: type || null,
+      category: category || null,
+      username: username || null,
+      orgname: orgname || null,
+      success: success === undefined || success === "" ? null : success === "true",
+      limit: limit,
+      cursor: cursor || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      items: result.items,
+      nextCursor: result.nextCursor,
+      retentionDays: LOG_RETENTION_DAYS,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/logs:", error);
+    return res.status(500).json({
+      success: false,
+      message: "No se pudieron consultar los registros.",
+      detail: error.message,
+    });
+  }
+});
+
+// Purga manual de registros antiguos. El cron diario ya la ejecuta sola.
+app.post("/api/logs/purge", requireAdmin, async (req, res) => {
+  try {
+    const days = Number(req.body?.retentionDays) || LOG_RETENTION_DAYS;
+    const result = await purgeOldLogs(days);
+    return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    console.error("❌ Error en POST /api/logs/purge:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ==================== Configuración de correo (admin) ====================
+// El remitente ya no está hardcodeado: se guarda en Firestore (settings/email)
+// y se edita desde /settings del administrador.
+
+app.get("/api/settings/email", requireAdmin, async (req, res) => {
+  try {
+    const settings = await getEmailSettings({ force: true });
+    return res.status(200).json({ success: true, settings });
+  } catch (error) {
+    console.error("❌ Error en GET /api/settings/email:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+app.post("/api/settings/email", requireAdmin, async (req, res) => {
+  try {
+    const { fromName, fromEmail, replyTo, supportEmail, enabled } = req.body;
+
+    if (fromEmail === undefined && fromName === undefined && enabled === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "Debe enviar al menos fromName, fromEmail o enabled.",
+      });
+    }
+
+    const settings = await saveEmailSettings({
+      fromName,
+      fromEmail,
+      replyTo,
+      supportEmail,
+      enabled,
+    });
+
+    console.log(`💾 [Settings] Remitente de correo actualizado: ${settings.from}`);
+    logEvent({
+      type: EVENT.EMAIL_SETTINGS_UPDATED,
+      req,
+      target: "settings/email",
+      message: "Configuración de correo actualizada.",
+      detail: { remitente: settings.from, habilitado: settings.enabled },
+    });
+    return res.status(200).json({
+      success: true,
+      message: "Configuración de correo guardada exitosamente.",
+      settings,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/settings/email:", error);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+// Límite simple en memoria para el correo de prueba: es un primitivo de
+// "enviar correo a una dirección arbitraria" y sin tope sirve para mail-bombing.
+const emailTestAttempts = [];
+const EMAIL_TEST_WINDOW_MS = 10 * 60 * 1000;
+const EMAIL_TEST_MAX = 5;
+
+// Envía un correo de prueba con el remitente configurado, para validar las
+// credenciales SMTP antes de dejarlo en producción.
+app.post("/api/settings/email/test", requireAdmin, async (req, res) => {
+  try {
+    const { to } = req.body;
+    if (!to) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Se requiere el destinatario 'to'." });
+    }
+
+    const ahora = Date.now();
+    while (emailTestAttempts.length > 0 && ahora - emailTestAttempts[0] > EMAIL_TEST_WINDOW_MS) {
+      emailTestAttempts.shift();
+    }
+    if (emailTestAttempts.length >= EMAIL_TEST_MAX) {
+      return res.status(429).json({
+        success: false,
+        message: `Demasiados correos de prueba. Máximo ${EMAIL_TEST_MAX} cada 10 minutos.`,
+      });
+    }
+    emailTestAttempts.push(ahora);
+
+    const settings = await getEmailSettings({ force: true });
+    const result = await sendMail({
+      from: settings.from,
+      to,
+      subject: "✅ Prueba de remitente - License Manager",
+      html: `<p>Este es un correo de prueba enviado desde <strong>${settings.from}</strong>.</p>
+             <p>Si lo recibiste, la configuración SMTP es correcta.</p>`,
+      text: `Correo de prueba enviado desde ${settings.from}. Si lo recibiste, la configuración SMTP es correcta.`,
+      replyTo: settings.replyTo,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Correo de prueba enviado desde ${settings.from}.`,
+      id: result.id,
+      rechazados: result.rejected,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/settings/email/test:", error.message);
+    return res.status(502).json({
+      success: false,
+      message: `No se pudo enviar por SMTP: ${error.message}`,
+    });
+  }
+});
+
+// Verifica credenciales y conectividad SMTP sin enviar ningún correo.
+app.get("/api/settings/email/verify", requireAdmin, async (req, res) => {
+  const cfg = smtpConfig();
+  try {
+    await verifyTransport();
+    return res.status(200).json({
+      success: true,
+      message: `Conexión SMTP correcta con ${cfg.host}:${cfg.port}.`,
+      host: cfg.host,
+      port: cfg.port,
+      secure: cfg.secure,
+      user: cfg.user,
+    });
+  } catch (error) {
+    console.error("❌ [SMTP] Verificación fallida:", error.message);
+    return res.status(502).json({
+      success: false,
+      message: `No se pudo conectar a ${cfg.host}:${cfg.port}: ${error.message}`,
+    });
+  }
+});
+
+// ==================== Integraciones (config admin) ====================
+// Se almacenan en la colección Firestore 'integrations'; cada documento es
+// una integración (por ejemplo 'whaibot', 'sms').
+
+// Obtener la configuración de todas las integraciones.
+app.get("/api/integrations", requireAdmin, async (req, res) => {
+  try {
+    const snapshot = await db.collection("integrations").get();
+    const integrations = {};
+    snapshot.docs.forEach((doc) => {
+      integrations[doc.id] = doc.data();
+    });
+    return res.status(200).json({ success: true, integrations });
+  } catch (error) {
+    console.error("❌ Error en GET /api/integrations:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// Guardar / actualizar la configuración de WhaiBot (botId + apiKey/clientKey).
+app.post("/api/integrations/whaibot", requireAdmin, async (req, res) => {
+  try {
+    const { botId, apiKey, enabled } = req.body;
+
+    if (!botId || !apiKey) {
+      return res.status(400).json({
+        success: false,
+        message: "botId y apiKey son requeridos.",
+      });
+    }
+
+    await db
+      .collection("integrations")
+      .doc("whaibot")
+      .set(
+        {
+          botId: String(botId).trim(),
+          apiKey: String(apiKey).trim(),
+          enabled: typeof enabled === "boolean" ? enabled : true,
+          updatedAt: Date.now(),
+        },
+        { merge: true },
+      );
+
+    console.log("💾 [Integración WhaiBot] configuración guardada");
+    // El apiKey no viaja al log: sanitizeDetail lo descartaría igualmente.
+    logEvent({
+      type: EVENT.INTEGRATION_UPDATED,
+      req,
+      target: "whaibot",
+      message: "Configuración de la integración WhaiBot actualizada.",
+      detail: { botId: String(botId).trim(), habilitado: typeof enabled === "boolean" ? enabled : true },
+    });
+    return res.status(200).json({
+      success: true,
+      message: "Configuración de WhaiBot guardada exitosamente.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/integrations/whaibot:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// Probar la conexión con WhaiBot mediante su health check.
+// Acepta botId/apiKey en el body (para probar antes de guardar); si no vienen,
+// usa los valores previamente guardados.
+app.post("/api/integrations/whaibot/test", requireAdmin, async (req, res) => {
+  try {
+    let { botId, apiKey } = req.body;
+
+    if (!botId || !apiKey) {
+      const doc = await db.collection("integrations").doc("whaibot").get();
+      if (doc.exists) {
+        botId = botId || doc.data().botId;
+        apiKey = apiKey || doc.data().apiKey;
+      }
+    }
+
+    if (!botId || !apiKey) {
+      return res.status(400).json({
+        success: false,
+        message: "botId y apiKey son requeridos para probar la conexión.",
+      });
+    }
+
+    const baseUrl = process.env.WHAIBOT_API_URL || "https://whaibot.com";
+
+    let whaibotResp;
+    try {
+      whaibotResp = await fetch(`${baseUrl}/api/health`, {
+        method: "GET",
+        headers: {
+          "x-client-key": String(apiKey).trim(),
+          "x-client-botid": String(botId).trim(),
+        },
+      });
+    } catch (netErr) {
+      console.error("❌ [WhaiBot test] error de red:", netErr.message);
+      return res.status(200).json({
+        success: false,
+        status: "error",
+        message:
+          "No se pudo contactar con WhaiBot (error de red). Verifica tu conexión.",
+      });
+    }
+
+    const data = await whaibotResp.json().catch(() => ({}));
+
+    if (whaibotResp.ok && data.success) {
+      return res.status(200).json({
+        success: true,
+        status: data.status || "ready",
+        botId: data.botId || botId,
+        message: data.message || "El bot está conectado y listo.",
+      });
+    }
+
+    // Respuesta no exitosa (bot no listo, credenciales inválidas, no encontrado…)
+    return res.status(200).json({
+      success: false,
+      status: data.status || "error",
+      httpStatus: whaibotResp.status,
+      message:
+        data.message ||
+        data.error ||
+        `No se pudo verificar el bot (HTTP ${whaibotResp.status}).`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/integrations/whaibot/test:", error);
+    return res.status(200).json({
+      success: false,
+      status: "error",
+      message: "Error interno al probar la conexión: " + error.message,
+    });
+  }
+});
+
+// Estado público de la integración WhaiBot (sin exponer credenciales).
+// Lo usan los clientes para saber si la opción de WhatsApp está disponible.
+app.get("/api/integrations/whaibot/status", async (req, res) => {
+  try {
+    const doc = await db.collection("integrations").doc("whaibot").get();
+    const cfg = doc.exists ? doc.data() : null;
+    const configured = !!(cfg && cfg.botId && cfg.apiKey);
+    const enabled = !!(cfg && cfg.enabled !== false && configured);
+    return res.status(200).json({ success: true, enabled, configured });
+  } catch (error) {
+    console.error("❌ Error en GET /api/integrations/whaibot/status:", error);
+    return res
+      .status(500)
+      .json({ success: false, enabled: false, configured: false });
+  }
+});
+
+// Enviar un mensaje de prueba de WhatsApp (vía WhaiBot) a los números del cliente.
+// Acepta { to: "<numero>" } o { numbers: ["<numero>", ...] }.
+app.post("/api/integrations/whaibot/send-test", async (req, res) => {
+  try {
+    const { to, numbers } = req.body;
+
+    // Normalizar destinos: solo dígitos, formato internacional sin '+'
+    let targets = [];
+    if (Array.isArray(numbers)) targets = numbers;
+    else if (to) targets = [to];
+    targets = targets
+      .map((n) => String(n).replace(/\D/g, ""))
+      .filter((n) => n.length >= 8);
+
+    if (targets.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Debes indicar al menos un número válido.",
+      });
+    }
+
+    const doc = await db.collection("integrations").doc("whaibot").get();
+    if (!doc.exists) {
+      return res.status(400).json({
+        success: false,
+        message: "La integración de WhatsApp (WhaiBot) no está configurada.",
+      });
+    }
+    const cfg = doc.data();
+    if (cfg.enabled === false) {
+      return res.status(403).json({
+        success: false,
+        message: "La integración de WhatsApp (WhaiBot) está deshabilitada.",
+      });
+    }
+    if (!cfg.botId || !cfg.apiKey) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "La integración de WhatsApp (WhaiBot) no está configurada correctamente.",
+      });
+    }
+
+    const baseUrl = process.env.WHAIBOT_API_URL || "https://whaibot.com";
+    const mensaje =
+      "✅ ¡Tu número ha sido configurado correctamente para recibir notificaciones de License Manager!\n\n" +
+      "Para asegurar la correcta entrega de los mensajes, por favor:\n" +
+      "1️⃣ Guarda este número en tus contactos.\n" +
+      "2️⃣ Responde a este mensaje indicando que estás de acuerdo con recibir notificaciones por WhatsApp.\n\n" +
+      "¡Gracias! 🙌";
+
+    const results = [];
+    for (const target of targets) {
+      try {
+        const r = await fetch(`${baseUrl}/api/send-message`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-client-key": String(cfg.apiKey).trim(),
+            "x-client-botid": String(cfg.botId).trim(),
+          },
+          body: JSON.stringify({
+            to: target,
+            message: mensaje,
+            fromMe: "License Manager",
+          }),
+        });
+        const data = await r.json().catch(() => ({}));
+        results.push({
+          to: target,
+          success: !!(r.ok && data.success),
+          message: data.message || data.error || `HTTP ${r.status}`,
+        });
+      } catch (err) {
+        results.push({
+          to: target,
+          success: false,
+          message: "Error de red: " + err.message,
+        });
+      }
+    }
+
+    const allOk = results.every((x) => x.success);
+    const anyOk = results.some((x) => x.success);
+    return res.status(200).json({
+      success: anyOk,
+      allSent: allOk,
+      results,
+      message: allOk
+        ? "Mensaje de prueba enviado correctamente."
+        : anyOk
+          ? "Algunos mensajes no se pudieron enviar."
+          : (results[0] && results[0].message) ||
+            "No se pudo enviar el mensaje de prueba.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/integrations/whaibot/send-test:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno al enviar el mensaje de prueba.",
+      detail: error.message,
+    });
+  }
+});
+
+// Endpoint para enviar correos por SMTP
+app.post("/api/sendmail", async (req, res) => {
+  let { to, subject, message, templateType, templateData, isNotification, lang } =
+    req.body;
 
   if (!to || !Array.isArray(to) || to.length === 0) {
     return res.status(400).json({
@@ -2479,20 +3271,59 @@ app.post("/api/sendmail", async (req, res) => {
     });
   }
 
+  // El envío de HTML arbitrario (subject + message libres) convertía este
+  // endpoint en un relay abierto desde el dominio corporativo. Ahora sólo se
+  // permite con token administrativo; el flujo normal usa plantillas.
+  if (!templateType && !requireAdminToken(req, res)) return;
+
+  // En staging no sale ningún correo de notificación: comparte SMTP y base de
+  // datos con producción y el cliente recibiría todo por duplicado.
+  if (notificationsBlocked()) {
+    console.warn(`🚫 [Sendmail] ${blockedReason()}. Destinatarios omitidos: ${to.length}`);
+    return res.status(409).json({
+      success: false,
+      code: "ENVIRONMENT_BLOCKED",
+      message: `${blockedReason()}. Este entorno no envía correos a los clientes.`,
+    });
+  }
+
   try {
+    const emailSettings = await getEmailSettings();
+
+    if (emailSettings.enabled === false) {
+      return res.status(409).json({
+        success: false,
+        message: "El envío de correos está deshabilitado en la configuración del administrador.",
+      });
+    }
+
+    let text;
+    let sentLanguage = null;
+
     // Si se recibe un templateType, generamos el HTML en el backend
     if (templateType && templateData) {
       let template;
+      // Idioma: el que indique quien llama y, si no lo indica, el configurado
+      // por el destinatario. Sin ninguno de los dos, español.
+      const language =
+        lang ||
+        templateData?.lang ||
+        templateData?.language ||
+        (await languageForRecipients(to));
+      sentLanguage = language;
+      const payload =
+        templateData && typeof templateData === "object"
+          ? { ...templateData, settings: emailSettings, lang: language }
+          : { settings: emailSettings, lang: language };
+
       if (isNotification) {
-        template = generateNotificationEmailTemplate(
-          templateType,
-          templateData,
-        );
+        template = generateNotificationEmailTemplate(templateType, payload);
       } else {
-        template = generateTemplate(templateType, templateData);
+        template = generateTemplate(templateType, payload);
       }
       subject = template.subject;
       message = template.html;
+      text = template.text;
     }
 
     if (!subject || !message) {
@@ -2503,30 +3334,40 @@ app.post("/api/sendmail", async (req, res) => {
       });
     }
 
-    const { data, error } = await resend.emails.send({
-      from: fromEmail,
-      to: to,
-      subject: subject,
+    const result = await sendMail({
+      from: emailSettings.from,
+      to,
+      subject,
       html: message,
+      text,
+      replyTo: emailSettings.replyTo,
     });
 
-    if (error) {
-      console.error("❌ Error devuelto por Resend:", error);
-      return res.status(400).json({
-        success: false,
-        message: "Resend Error: " + error.message,
-      });
-    }
-
-    console.log("✅ Correo enviado con éxito. ID:", data.id);
+    console.log(`✅ Correo enviado con éxito. ID: ${result.id}`);
+    logEvent({
+      type: EVENT.EMAIL_SENT,
+      req,
+      target: to.join(", "),
+      message: `Correo "${templateType || "personalizado"}" enviado a ${to.length} destinatario(s).`,
+      detail: { plantilla: templateType || null, idioma: sentLanguage, rechazados: result.rejected?.length || 0 },
+    });
     return res.status(200).json({
       success: true,
       message: "Correos enviados con éxito",
-      id: data.id,
+      id: result.id,
+      rechazados: result.rejected,
     });
   } catch (error) {
-    console.error("❌ Error al enviar correo (Resend):", error);
-    return res.status(500).json({
+    console.error("❌ Error al enviar correo (SMTP):", error.message);
+    logEvent({
+      type: EVENT.EMAIL_SENT,
+      req,
+      target: to.join(", "),
+      success: false,
+      message: `Fallo al enviar correo: ${error.message}`,
+      detail: { plantilla: templateType || null },
+    });
+    return res.status(502).json({
       success: false,
       message:
         "Error al enviar correo: " + (error.message || "Error desconocido"),
@@ -2688,8 +3529,154 @@ app.get("/api/reports/byoc-voice-divisions", async (req, res) => {
   }
 });
 
+// ── Consumo de IVR (Genesys Cloud IVR Basic Per Minute Charge) por división ──
+// Usa la métrica de Analytics `tIvr` (tiempo en IVR) agrupada por divisionId.
+app.get("/api/reports/ivr-divisions", async (req, res) => {
+  try {
+    const { startDate, endDate, timezone, region } = req.query;
+    const accessToken =
+      req.query.accessToken ||
+      (req.headers.authorization && req.headers.authorization.split(" ")[1]);
+
+    if (!accessToken || !startDate || !endDate || !region) {
+      return res.status(400).json({
+        success: false,
+        error: "Se requieren startDate, endDate, accessToken y region",
+      });
+    }
+
+    const url = getRegionUrl(region);
+
+    // ── Timezone offset ───────────────────────────────────────────────────
+    let offsetStart = "Z";
+    let offsetEnd = "Z";
+    if (timezone) {
+      try {
+        const fmtStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzStart = fmtStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetStart = tzStart.replace("GMT", "") || "Z";
+
+        const fmtEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+        const tzEnd = fmtEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+        offsetEnd = tzEnd.replace("GMT", "") || "Z";
+      } catch (e) {
+        console.error("Error al calcular timezone offset:", e);
+      }
+    }
+
+    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
+
+    console.log(`🔊 [ivr-divisions] interval=${interval}  region=${region}`);
+
+    // ── Get Divisions to map IDs to Names ─────────────────────────────────
+    const divisionsObj = await getDivisions(accessToken, region, false);
+    const divisionsMap = {};
+    divisionsObj.forEach(div => { divisionsMap[div.id] = div.name; });
+
+    // ── Query Flows Aggregates by division (tFlow = tiempo en IVR/flujo) ───
+    // Nota: tFlow/nFlow son métricas de FLUJO, por lo que se consultan en el
+    // endpoint de flows aggregates (no en conversations, que devuelve 403).
+    const payload = {
+      interval: interval,
+      groupBy: ["divisionId"],
+      metrics: [
+        "nFlow", // Nº de ejecuciones de flujo (IVR)
+        "tFlow"  // Tiempo total en flujo / IVR (ms)
+      ],
+      filter: {
+        type: "and",
+        predicates: [
+          {
+            type: "dimension",
+            dimension: "mediaType",
+            operator: "matches",
+            value: "voice"
+          }
+        ]
+      }
+    };
+
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`
+    };
+
+    const apiResponse = await fetch(`${url}/api/v2/analytics/flows/aggregates/query`, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(payload)
+    });
+
+    if (!apiResponse.ok) {
+      const errorText = await apiResponse.text();
+      console.error(`❌ [ivr-divisions] API error ${apiResponse.status}:`, errorText);
+      return res.status(apiResponse.status).json({
+        success: false,
+        error: `Error de la API de Genesys Cloud: ${apiResponse.status}`
+      });
+    }
+
+    const apiData = await apiResponse.json();
+
+    // ── Build division results ────────────────────────────────────────────
+    const divisionResults = [];
+
+    if (apiData.results && apiData.results.length > 0) {
+      apiData.results.forEach(group => {
+        const divId = group.group?.divisionId || "Home";
+        const divisionName = divisionsMap[divId] || (divId === "Home" ? "Home / Default" : divId);
+
+        let tFlow = 0;
+        let nFlow = 0;
+
+        if (group.data && group.data[0] && group.data[0].metrics) {
+          group.data[0].metrics.forEach(m => {
+            switch (m.metric) {
+              case "nFlow":
+                nFlow = m.stats.count || 0;        // nº de ejecuciones de flujo/IVR
+                break;
+              case "tFlow":
+                tFlow = (m.stats.sum || 0) / 1000; // ms a segundos
+                break;
+            }
+          });
+        }
+
+        // Solo incluir divisiones que efectivamente usaron IVR (flujo)
+        if (tFlow > 0 || nFlow > 0) {
+          divisionResults.push({
+            divisionId: divId,
+            divisionName,
+            nIvr: nFlow,
+            tIvr: tFlow,
+            ivrMinutes: Math.round(tFlow / 60)
+          });
+        }
+      });
+    }
+
+    // Ordenar por tiempo de IVR (flujo) descendente
+    divisionResults.sort((a, b) => b.tIvr - a.tIvr);
+
+    console.log(`✅ [ivr-divisions] ${divisionResults.length} divisiones con IVR encontradas`);
+
+    return res.status(200).json({
+      success: true,
+      data: divisionResults,
+      interval
+    });
+
+  } catch (error) {
+    console.error("Error en ivr-divisions:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Error interno del servidor"
+    });
+  }
+});
+
 // Endpoint de prueba para guardar algo en Firestore
-app.post("/api/firestore-test", async (req, res) => {
+app.post("/api/firestore-test", requireAdmin, async (req, res) => {
   try {
     if (!db) {
       return res.status(500).json({
