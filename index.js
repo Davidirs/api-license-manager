@@ -2016,13 +2016,11 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
-      // Para resúmenes y análisis rápidos de dashboards, desactivar thinking mode reduce la latencia
-      extra_body: {
-        thinking: {
-          type: process.env.DEEPSEEK_THINKING === 'true' ? 'enabled' : 'disabled'
-        }
+      // En DeepSeek V4 la propiedad thinking va en la raíz del payload JSON
+      thinking: {
+        type: process.env.DEEPSEEK_THINKING === 'true' ? 'enabled' : 'disabled'
       },
-      max_tokens: 2000
+      max_tokens: 4000
     };
   } else {
     endpoint = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
@@ -2064,7 +2062,8 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
   }
 
   const data = await response.json();
-  const aiText = data.choices?.[0]?.message?.content;
+  const choice = data.choices?.[0]?.message;
+  const aiText = choice?.content || choice?.reasoning_content;
   return aiText;
 }
 
