@@ -1994,19 +1994,84 @@ app.get("/api/reports/ia-tokens-daily", async (req, res) => {
   }
 });
 
-// Endpoint para analizar métricas con IA (usando Groq API y API Key del Servidor)
+// Helper para invocar servicio de IA (DeepSeek por defecto, con soporte configurable / fallback a Groq)
+async function callAiChatCompletion({ systemPrompt, userPrompt }) {
+  const deepseekApiKey = (process.env.DEEPSEEK_API_KEY || "").trim();
+  const groqApiKey = (process.env.GROQ_API_KEY || "").trim();
+
+  // Si no se define AI_PROVIDER explícito: usar deepseek si tiene key, si no groq
+  const explicitProvider = process.env.AI_PROVIDER ? process.env.AI_PROVIDER.toLowerCase().trim() : null;
+  const configuredProvider = explicitProvider || (deepseekApiKey ? 'deepseek' : 'groq');
+
+  let requestBody;
+
+  if (configuredProvider === 'deepseek') {
+    endpoint = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com/chat/completions';
+    apiKey = deepseekApiKey;
+    model = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
+
+    requestBody = {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      // Para resúmenes y análisis rápidos de dashboards, desactivar thinking mode reduce la latencia
+      extra_body: {
+        thinking: {
+          type: process.env.DEEPSEEK_THINKING === 'true' ? 'enabled' : 'disabled'
+        }
+      },
+      max_tokens: 2000
+    };
+  } else {
+    endpoint = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
+    apiKey = groqApiKey;
+    model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+
+    requestBody = {
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.7,
+      max_tokens: 2000
+    };
+  }
+
+  if (!apiKey) {
+    const missingVar = configuredProvider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'GROQ_API_KEY';
+    const err = new Error(`${missingVar} no está configurado en el servidor.`);
+    err.status = 500;
+    throw err;
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    const err = new Error(`AI API error (${configuredProvider}): ${response.status} - ${errText}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const data = await response.json();
+  const aiText = data.choices?.[0]?.message?.content;
+  return aiText;
+}
+
+// Endpoint para analizar métricas con IA (DeepSeek / Groq)
 app.post("/api/analyze-metrics", async (req, res) => {
   try {
     const { clientData, dailyLogins, outboundAttempts, overageDetailsText, lang, languageName } = req.body;
-
-    const groqApiKey = process.env.GROQ_API_KEY;
-
-    if (!groqApiKey) {
-      return res.status(500).json({
-        success: false,
-        error: "GROQ_API_KEY no está configurado en el servidor."
-      });
-    }
 
     // El idioma se resuelve en el backend, no se toma tal cual del cliente:
     // antes llegaba una cadena libre y bastaba una clave de traducción sin
@@ -2045,34 +2110,7 @@ ${JSON.stringify(outboundAttempts, null, 2)}
 ${p.metricsOverage}
 ${overageDetailsText || p.metricsNoOverage}`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${groqApiKey}`
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.7,
-        max_tokens: 2000
-      })
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Groq API error: ${response.status} - ${errText}`);
-    }
-
-    const data = await response.json();
-    // Si el modelo no devuelve nada se responde con un código, no con un texto:
-    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
-    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
-    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
-    const aiText = data.choices[0]?.message?.content;
+    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt });
     if (!aiText) {
       return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
     }
@@ -2084,7 +2122,7 @@ ${overageDetailsText || p.metricsNoOverage}`;
 
   } catch (error) {
     console.error("Error en analyze-metrics:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -2092,14 +2130,6 @@ ${overageDetailsText || p.metricsNoOverage}`;
 app.post("/api/analyze-comparison", async (req, res) => {
   try {
     const { kpiData, selectedCategories, kpiName, lang, languageName } = req.body;
-
-    const groqApiKey = process.env.GROQ_API_KEY;
-    if (!groqApiKey) {
-      return res.status(500).json({
-        success: false,
-        error: "GROQ_API_KEY no está configurado en el servidor."
-      });
-    }
 
     const idiomaAnalisis = lang || languageName;
     const p = promptsFor(idiomaAnalisis);
@@ -2131,34 +2161,7 @@ ${kpiName ? p.comparisonFocus.replace("{{kpi}}", kpiName) : p.comparisonGeneral}
 ${p.comparisonEach}
 ${p.comparisonSections.map((s) => `- ${s}`).join("\n")}`;
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${groqApiKey}`
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.7,
-        max_tokens: 2000
-      })
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Groq API error: ${response.status} - ${errText}`);
-    }
-
-    const data = await response.json();
-    // Si el modelo no devuelve nada se responde con un código, no con un texto:
-    // el mensaje que ve el usuario lo pone el front en SU idioma. Antes se
-    // devolvía "No se pudo obtener respuesta" en español y se pintaba tal cual
-    // como si fuera el análisis, incluso para usuarios en inglés o portugués.
-    const aiText = data.choices[0]?.message?.content;
+    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt });
     if (!aiText) {
       return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
     }
@@ -2170,7 +2173,7 @@ ${p.comparisonSections.map((s) => `- ${s}`).join("\n")}`;
 
   } catch (error) {
     console.error("Error en analyze-comparison:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
