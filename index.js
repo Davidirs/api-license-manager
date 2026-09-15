@@ -653,7 +653,7 @@ app.listen(port, () => {
 app.post("/api/monitor/run", async (req, res) => {
   if (!requireAdminToken(req, res)) return;
 
-  console.log("▶️ Forzando ejecución del monitor desde endpoint administrativo...");
+  console.log(`[${new Date().toISOString()}] ▶️ Forzando ejecución manual del monitor desde endpoint administrativo...`);
   logEvent({
     type: EVENT.MONITOR_RUN,
     req,
@@ -661,7 +661,7 @@ app.post("/api/monitor/run", async (req, res) => {
     detail: { entorno: currentEnv(), notificacionesBloqueadas: notificationsBlocked() },
   });
   runDailyMonitor().catch((err) =>
-    console.error("❌ Ejecución manual del monitor falló:", err.message),
+    console.error(`[${new Date().toISOString()}] ❌ Ejecución manual del monitor falló:`, err.message),
   );
   return res.json({
     success: true,
@@ -1995,7 +1995,7 @@ app.get("/api/reports/ia-tokens-daily", async (req, res) => {
 });
 
 // Helper para invocar servicio de IA (DeepSeek por defecto, con soporte configurable / fallback a Groq)
-async function callAiChatCompletion({ systemPrompt, userPrompt }) {
+async function callAiChatCompletion({ systemPrompt, userPrompt, maxTokens }) {
   const deepseekApiKey = (process.env.DEEPSEEK_API_KEY || "").trim();
   const groqApiKey = (process.env.GROQ_API_KEY || "").trim();
 
@@ -2020,7 +2020,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
       thinking: {
         type: process.env.DEEPSEEK_THINKING === 'true' ? 'enabled' : 'disabled'
       },
-      max_tokens: 4000
+      max_tokens: maxTokens || 4000
     };
   } else {
     endpoint = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
@@ -2034,7 +2034,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
         { role: 'user', content: userPrompt }
       ],
       temperature: 0.7,
-      max_tokens: 2000
+      max_tokens: maxTokens || 2000
     };
   }
 
@@ -2080,22 +2080,37 @@ app.post("/api/analyze-metrics", async (req, res) => {
     const idiomaAnalisis = lang || languageName;
     const p = promptsFor(idiomaAnalisis);
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas.
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un análisis sumamente conciso, directo y breve.
 
 ${languageRule(idiomaAnalisis)}
 
-REGLAS DE FORMATO OBLIGATORIAS:
-1. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto del análisis.
-2. Para las listas y puntos, utiliza "1.- " para números o "- " para viñetas, nunca uses "*".
-3. En la sección de Recomendaciones, debes sugerir explícitamente que a través de la opción de "Último Login" (en Conexiones Diarias) el administrador puede detectar usuarios inactivos que no han iniciado sesión en los últimos meses. Recomienda desactivar estas cuentas en la organización de Genesys Cloud para evitar que por algún motivo inicien sesión por error y consuman licencias innecesarias de la organización.
-4. Si se proporciona información de sobreuso de licencias, analízala indicando en qué licencias se excedió el compromiso y en cuánto, y qué implica ese exceso.
-5. Los datos que recibes son agregados y NO incluyen identidades de agentes. No inventes ni menciones nombres, correos, divisiones ni fechas de inicio de sesión de personas concretas: si el análisis requiere ese detalle, remite al reporte de "Último Login" del panel.`;
+REGLAS DE FORMATO Y ESTRUCTURA OBLIGATORIAS:
+1. El análisis debe contener ÚNICAMENTE las siguientes 3 secciones (sin secciones adicionales, sin recomendaciones largas ni texto de relleno):
 
-    // Los encabezados van ya en el idioma de salida: si se piden en español, el
-    // modelo los copia literalmente y devuelve títulos en español dentro de un
-    // análisis en otro idioma.
+${p.sectionSummary}:
+Un único párrafo corto (máximo 3 a 5 líneas) resumiendo la organización, período de facturación, uso general de licencias indicando si hubo sobreuso frente a lo prepagado, y una breve mención de recursos como almacenamiento, tokens de IA e intentos de salida.
+
+${p.sectionKpis}:
+Una lista de viñetas con guion "- ", con exactamente una línea concisa por cada KPI:
+- ${p.kpiLicenses}: [resumen de 1 frase del uso vs prepagadas y si hay exceso o está dentro del límite]
+- ${p.kpiResources}: [resumen de 1 frase de unidades utilizadas vs límite comprometido]
+- ${p.kpiStorage}: [resumen de 1 frase de almacenamiento disponible o utilizado]
+- ${p.kpiAiTokens}: [resumen de 1 frase de tokens utilizados vs límite incluido]
+- ${p.kpiOutbound}: [resumen de 1 frase de total de intentos de salida distribuidos en campañas]
+
+${p.sectionAlerts}:
+Una lista de viñetas con guion "- ":
+- Si hay sobreuso: una viñeta indicando la licencia y cantidad de usuarios excedidos, y si aplica, otra viñeta indicando que los últimos usuarios que consumieron licencias corresponden a los mencionados en la sección de detalles de sobreuso y últimos inicios de sesión.
+- Si no hay sobreuso: una sola viñeta indicando que no se ha detectado sobreuso de licencias ni de recursos.
+
+2. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto.
+3. Los encabezados de sección deben ir exactamente con el título seguido de dos puntos (ejemplo "${p.sectionSummary}:", "${p.sectionKpis}:", "${p.sectionAlerts}:"), sin números.
+4. Para las viñetas utiliza únicamente el guion "- ", nunca asteriscos "*".
+5. Los datos que recibes son agregados y no incluyen identidades de agentes. No inventes nombres, correos ni datos personales.
+6. Mantén la extensión total muy corta, semejante a 3 párrafos o bloques breves.`;
+
+    // Los datos y encabezados en el idioma correspondiente
     const userPrompt = `${p.metricsIntro}
-${numbered(p.metricsSections)}
 
 ${p.metricsLicenses}
 ${JSON.stringify(clientData, null, 2)}
@@ -2109,7 +2124,7 @@ ${JSON.stringify(outboundAttempts, null, 2)}
 ${p.metricsOverage}
 ${overageDetailsText || p.metricsNoOverage}`;
 
-    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt });
+    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt, maxTokens: 1000 });
     if (!aiText) {
       return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
     }
@@ -2124,6 +2139,7 @@ ${overageDetailsText || p.metricsNoOverage}`;
     return res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
+
 
 // Endpoint para analizar comparativa entre periodos con IA
 app.post("/api/analyze-comparison", async (req, res) => {

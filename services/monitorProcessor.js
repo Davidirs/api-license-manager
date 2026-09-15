@@ -266,7 +266,7 @@ async function processOrgMonitor(jobData) {
     const decision = decideAlert(previousState, evaluation);
 
     console.log(
-      `[Monitor] ${orgname} · umbral ${threshold}% → ${decision.action} (${decision.reason}) | críticas: ${evaluation.critical.length}`,
+      `[${new Date().toISOString()}] [Monitor] ${orgname} · umbral ${threshold}% → ${decision.action} (${decision.reason}) | críticas: ${evaluation.critical.length}`,
     );
 
     if (decision.action === "none") continue;

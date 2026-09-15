@@ -196,24 +196,31 @@ function currentHourKey() {
   return new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
 }
 
+function currentTimestamp() {
+  return new Date().toISOString();
+}
+
 async function runDailyMonitor() {
   const started = Date.now();
-  console.log("🕒 [Cron] Iniciando monitor de correos...");
+  const startTime = currentTimestamp();
+  console.log(`\n=============================================================`);
+  console.log(`🕒 [Cron] [${startTime}] Iniciando monitor de correos...`);
+  console.log(`=============================================================`);
 
   try {
     const orgs = await loadActiveOrganizations();
     console.log(
-      `[Cron] Organizaciones activas: ${Object.keys(orgs.byId).length} | omitidas → inactivas: ${orgs.skipped.inactive}, sin credenciales: ${orgs.skipped.sinCredenciales}, región inválida: ${orgs.skipped.regionInvalida}`,
+      `[Cron] [${currentTimestamp()}] Organizaciones activas: ${Object.keys(orgs.byId).length} | omitidas → inactivas: ${orgs.skipped.inactive}, sin credenciales: ${orgs.skipped.sinCredenciales}, región inválida: ${orgs.skipped.regionInvalida}`,
     );
 
     if (Object.keys(orgs.byId).length === 0) {
-      console.log("[Cron] No hay organizaciones activas con credenciales. Fin.");
+      console.log(`[Cron] [${currentTimestamp()}] No hay organizaciones activas con credenciales. Fin.`);
       return { organizaciones: 0 };
     }
 
     const { jobs, stats } = await buildOrgJobs(orgs);
     console.log(
-      `[Cron] Usuarios: ${stats.usuarios} | notificables: ${stats.notificables} | omitidos → inactivos: ${stats.inactivos}, sin notificaciones: ${stats.sinNotificaciones}, sin destinatarios: ${stats.sinDestinatarios}, sin org activa: ${stats.sinOrgActiva}`,
+      `[Cron] [${currentTimestamp()}] Usuarios: ${stats.usuarios} | notificables: ${stats.notificables} | omitidos → inactivos: ${stats.inactivos}, sin notificaciones: ${stats.sinNotificaciones}, sin destinatarios: ${stats.sinDestinatarios}, sin org activa: ${stats.sinOrgActiva}`,
     );
 
     const hourKey = currentHourKey();
@@ -223,36 +230,40 @@ async function runDailyMonitor() {
       try {
         await enqueueOrgMonitor(jobs[orgId], hourKey);
       } catch (error) {
-        console.error(`[Cron] No se pudo encolar la org ${orgId}:`, error.message);
+        console.error(`[Cron] [${currentTimestamp()}] No se pudo encolar la org ${orgId}:`, error.message);
       }
     }
 
     console.log(
-      `🏁 [Cron] ${orgIds.length} organizaciones encoladas en ${Date.now() - started}ms.`,
+      `🏁 [Cron] [${currentTimestamp()}] ${orgIds.length} organizaciones encoladas en ${Date.now() - started}ms.`,
     );
 
     return { organizaciones: orgIds.length, usuarios: stats.notificables, hourKey };
   } catch (error) {
-    console.error("❌ [Cron] Error general en el monitor:", error);
+    console.error(`❌ [Cron] [${currentTimestamp()}] Error general en el monitor:`, error);
     throw error;
   }
 }
 
 function initCron() {
   cron.schedule(CRON_EXPRESSION, () => {
+    const triggerTime = currentTimestamp();
+    console.log(`\n⏰ [Cron Trigger] [${triggerTime}] Disparo programado ejecutado.`);
     runDailyMonitor().catch((err) =>
-      console.error("❌ [Cron] Ejecución programada falló:", err.message),
+      console.error(`❌ [Cron] [${currentTimestamp()}] Ejecución programada falló:`, err.message),
     );
   });
-  console.log(`🕰️ [Cron] Orquestador inicializado con la expresión "${CRON_EXPRESSION}".`);
+  console.log(`[${currentTimestamp()}] 🕰️ [Cron] Orquestador inicializado con la expresión "${CRON_EXPRESSION}".`);
 
   // Purga diaria del log de accesos: sin ella la colección crece sin techo.
   cron.schedule(LOG_PURGE_CRON, () => {
+    const purgeTime = currentTimestamp();
+    console.log(`\n🧹 [Cron] [${purgeTime}] Iniciando purga diaria de logs programada...`);
     purgeOldLogs().catch((err) =>
-      console.error("❌ [Cron] Purga de logs falló:", err.message),
+      console.error(`❌ [Cron] [${currentTimestamp()}] Purga de logs falló:`, err.message),
     );
   });
-  console.log(`🧹 [Cron] Purga de logs programada con la expresión "${LOG_PURGE_CRON}".`);
+  console.log(`[${currentTimestamp()}] 🧹 [Cron] Purga de logs programada con la expresión "${LOG_PURGE_CRON}".`);
 }
 
 module.exports = {

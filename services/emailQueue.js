@@ -22,6 +22,11 @@ const QUEUE_NAME = "EmailsQueue";
 let emailQueue = null;
 let emailWorker = null;
 
+function safeJobId(raw) {
+  if (!raw) return undefined;
+  return String(raw).replace(/:/g, "_");
+}
+
 if (isQueueEnabled()) {
   emailQueue = new Queue(QUEUE_NAME, {
     connection: getRedisConnection(),
@@ -48,12 +53,12 @@ if (isQueueEnabled()) {
   );
 
   emailWorker.on("completed", (job) => {
-    console.log(`✅ [Worker] Job ${job.id} de correo enviado a ${job.data.to}`);
+    console.log(`[${new Date().toISOString()}] ✅ [Worker] Job ${job.id} de correo enviado a ${job.data.to}`);
   });
 
   emailWorker.on("failed", (job, err) => {
     console.error(
-      `❌ [Worker] Job ${job?.id} falló al enviar correo a ${job?.data?.to}:`,
+      `[${new Date().toISOString()}] ❌ [Worker] Job ${job?.id} falló al enviar correo a ${job?.data?.to}:`,
       err.message,
     );
   });
@@ -160,12 +165,12 @@ async function enqueueEmail(tipo, data, to, isNotification = false, options = {}
     name: "send-email",
     data: { tipo, data, to: [recipient], isNotification },
     opts: options.dedupeKey
-      ? { jobId: `${options.dedupeKey}:${recipient}` }
+      ? { jobId: safeJobId(`${options.dedupeKey}_${recipient}`) }
       : undefined,
   }));
 
   await emailQueue.addBulk(jobs);
-  console.log(`📥 [Queue] Encolados ${jobs.length} correos de tipo '${tipo}'`);
+  console.log(`[${new Date().toISOString()}] 📥 [Queue] Encolados ${jobs.length} correos de tipo '${tipo}'`);
   return { enqueued: jobs.length };
 }
 
