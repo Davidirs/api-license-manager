@@ -31,6 +31,8 @@ const EVENT = {
   SESSION_EXPIRED: "session_expired",
   SESSION_INVALID: "session_invalid",
   ACCESS_DENIED: "access_denied",
+  PASSWORD_RESET_REQUESTED: "password_reset_requested",
+  PASSWORD_RESET_COMPLETED: "password_reset_completed",
 
   // Acciones sensibles
   USER_CREATED: "user_created",
@@ -39,6 +41,7 @@ const EVENT = {
   ORG_CREATED: "org_created",
   ORG_UPDATED: "org_updated",
   ORG_STATUS_CHANGED: "org_status_changed",
+  ORG_AI_CHANGED: "org_ai_changed",
   EMAIL_SETTINGS_UPDATED: "email_settings_updated",
   INTEGRATION_UPDATED: "integration_updated",
   EMAIL_SENT: "email_sent",
@@ -58,6 +61,8 @@ const AUTH_EVENTS = new Set([
   EVENT.SESSION_EXPIRED,
   EVENT.SESSION_INVALID,
   EVENT.ACCESS_DENIED,
+  EVENT.PASSWORD_RESET_REQUESTED,
+  EVENT.PASSWORD_RESET_COMPLETED,
 ]);
 
 function categoryOf(type) {

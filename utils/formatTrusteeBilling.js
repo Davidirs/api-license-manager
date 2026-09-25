@@ -88,6 +88,11 @@ function formatTrusteeBilling(billingData) {
     "TrueEngage Omnichannel Web & App Customer Contact",
     "Genesys Cloud IVR Basic Per Minute Charge",
     "Genesys Cloud API Resource Usage",
+    "WhatsApp Authentication Conversation Pass-Through",
+    "WhatsApp Marketing Conversation Pass-Through",
+    "WhatsApp Service Conversation Pass-Through",
+    "WhatsApp Template Message",
+    "WhatsApp Utility Conversation Pass-Through",
   ];
 
   const listNameAddons = [
@@ -244,13 +249,29 @@ function formatTrusteeBilling(billingData) {
     facturacion: {
       // subscriptionoverview puede usar periodStartDate/periodEndDate
       // trusteebillingoverview usa billingPeriodStartDate/billingPeriodEndDate
-      inicio: billingData.billingPeriodStartDate || billingData.periodStartDate || billingData.startDate || null,
-      final: billingData.billingPeriodEndDate || billingData.periodEndDate || billingData.endDate || null,
+      inicio:
+        billingData.billingPeriodStartDate ||
+        billingData.periodStartDate ||
+        billingData.startDate ||
+        null,
+      final:
+        billingData.billingPeriodEndDate ||
+        billingData.periodEndDate ||
+        billingData.endDate ||
+        null,
     },
     rampUp: {
       // rampPeriod puede no existir en subscriptionoverview; usamos la facturación como fallback
-      inicio: billingData.rampPeriodStartDate || billingData.billingPeriodStartDate || billingData.periodStartDate || null,
-      final: billingData.rampPeriodEndDate || billingData.billingPeriodEndDate || billingData.periodEndDate || null,
+      inicio:
+        billingData.rampPeriodStartDate ||
+        billingData.billingPeriodStartDate ||
+        billingData.periodStartDate ||
+        null,
+      final:
+        billingData.rampPeriodEndDate ||
+        billingData.billingPeriodEndDate ||
+        billingData.periodEndDate ||
+        null,
     },
     storage: {
       comprometido: storage?.prepayQuantity ?? 0,

@@ -116,6 +116,13 @@ const { notificationsBlocked, blockedReason, currentEnv } = require("./utils/env
 const { normalizeLanguage, SUPPORTED_LANGUAGES } = require("./utils/emailI18n");
 const { promptsFor, languageRule, numbered } = require("./utils/aiPrompts");
 const { languageForRecipients, forgetRecipient } = require("./utils/userLanguage");
+const {
+  MIN_PASSWORD_LENGTH,
+  createResetToken,
+  findValidReset,
+  invalidatePending,
+  passwordPolicyError,
+} = require("./utils/passwordReset");
 
 /**
  * Guard para endpoints administrativos que pueden disparar envíos masivos.
@@ -479,6 +486,8 @@ app.post("/api/login", async (req, res) => {
       userResponse.orgId = targetOrgData.orgId || targetOrgDoc.id;
       userResponse.region = targetOrgData.region || userFound.region;
       userResponse.orgToken = orgToken;
+      // Si la organización permite el análisis con IA (ver /api/organization/ai).
+      userResponse.aiEnabled = targetOrgData.aiEnabled !== false;
 
       console.log(
         `🏢 Org encontrada: ${orgname} | orgId: ${userResponse.orgId} | orgToken generado: ${!!orgToken}`,
@@ -2068,7 +2077,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt, maxTokens }) {
 }
 
 // Endpoint para analizar métricas con IA (DeepSeek / Groq)
-app.post("/api/analyze-metrics", async (req, res) => {
+app.post("/api/analyze-metrics", requireAiEnabled, async (req, res) => {
   try {
     const { clientData, dailyLogins, outboundAttempts, overageDetailsText, lang, languageName } = req.body;
 
@@ -2142,7 +2151,7 @@ ${overageDetailsText || p.metricsNoOverage}`;
 
 
 // Endpoint para analizar comparativa entre periodos con IA
-app.post("/api/analyze-comparison", async (req, res) => {
+app.post("/api/analyze-comparison", requireAiEnabled, async (req, res) => {
   try {
     const { kpiData, selectedCategories, kpiName, lang, languageName } = req.body;
 
@@ -2516,13 +2525,20 @@ app.post("/api/setuser", async (req, res) => {
           {
             orgId: orgId,
             orgname: orgname,
-            thrusted: body.thrusted || userToCreate.thrusted || "N/A",
+            thrusted:
+              body.thrusted ||
+              (Array.isArray(userToCreate.thrusted)
+                ? userToCreate.thrusted[0]
+                : userToCreate.thrusted) ||
+              "N/A",
             region: body.region || userToCreate.region || "us-east-1",
             clientId: body.clientId || userToCreate.clientId || "",
             clientSecret: body.clientSecret || userToCreate.clientSecret || "",
             criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
             // Preservar el estado 'active' existente; por defecto activa.
             active: orgDoc.exists ? orgDoc.data().active ?? true : true,
+            // Uso de IA: se preserva el existente; activo por defecto.
+            aiEnabled: orgDoc.exists ? orgDoc.data().aiEnabled ?? true : true,
           },
           { merge: true },
         );
@@ -2533,7 +2549,10 @@ app.post("/api/setuser", async (req, res) => {
         username: cleanUsername,
         passwordHash: passwordHash,
         role: userToCreate.role || "client",
-        thrusted: userToCreate.thrusted || body.thrusted || "N/A",
+        thrusted:
+          userToCreate.thrusted !== undefined
+            ? userToCreate.thrusted
+            : body.thrusted || "N/A",
         orgname: orgname,
         orgId: orgId,
         clientId: userToCreate.clientId || body.clientId || (orgDoc.exists ? orgDoc.data().clientId : "") || "",
@@ -2653,7 +2672,7 @@ app.post("/api/setuser", async (req, res) => {
 app.post("/api/organization", requireAdmin, async (req, res) => {
   try {
     const body = req.body;
-    const { orgId, orgname, thrusted, region, clientId, clientSecret, active } =
+    const { orgId, orgname, thrusted, region, clientId, clientSecret, active, aiEnabled } =
       body;
 
     if (!orgId || !orgname) {
@@ -2676,6 +2695,15 @@ app.post("/api/organization", requireAdmin, async (req, res) => {
           ? orgDoc.data().active ?? true
           : true;
 
+    // Uso de IA: igual que 'active'. Las organizaciones nuevas nacen con la
+    // IA activa; el administrador puede desactivarla después.
+    const resolvedAiEnabled =
+      typeof aiEnabled === "boolean"
+        ? aiEnabled
+        : orgDoc.exists
+          ? orgDoc.data().aiEnabled ?? true
+          : true;
+
     await orgRef.set(
       {
         orgId: cleanOrgId,
@@ -2686,6 +2714,7 @@ app.post("/api/organization", requireAdmin, async (req, res) => {
         clientSecret: clientSecret || "",
         criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
         active: resolvedActive,
+        aiEnabled: resolvedAiEnabled,
       },
       { merge: true },
     );
@@ -2818,6 +2847,398 @@ app.post("/api/user/status", requireAdmin, async (req, res) => {
       message: "Error interno del servidor",
       detail: error.message,
     });
+  }
+});
+
+// ==================== Uso de IA por organización ====================
+// El análisis con IA (botón flotante del dashboard y análisis del comparativo)
+// envía métricas agregadas a un proveedor externo (DeepSeek / Groq). Una
+// organización puede no querer compartir datos con terceros, así que el
+// administrador puede desactivarlo.
+//
+// Convención igual que `active`: si el campo `aiEnabled` falta, la IA está
+// activa; sólo `aiEnabled === false` la desactiva.
+
+/** Documento de una organización por id (con respaldo por el campo `orgId`). */
+async function findOrgDoc(orgId) {
+  if (!orgId) return null;
+  const clean = String(orgId).trim();
+  const direct = await db.collection("organizations").doc(clean).get();
+  if (direct.exists) return direct;
+  const snapshot = await db
+    .collection("organizations")
+    .where("orgId", "==", clean)
+    .limit(1)
+    .get();
+  return snapshot.empty ? null : snapshot.docs[0];
+}
+
+/**
+ * ¿Puede la sesión actual usar la IA? Se decide por la organización de la
+ * sesión (la del JWT), no por lo que mande el navegador.
+ */
+async function isAiEnabledForSession(req) {
+  const orgDoc = await findOrgDoc(req.auth?.orgId);
+  // Sin organización resoluble se mantiene el comportamiento previo (activa).
+  if (!orgDoc) return true;
+  return orgDoc.data().aiEnabled !== false;
+}
+
+/** Middleware para los endpoints que llaman al proveedor de IA. */
+async function requireAiEnabled(req, res, next) {
+  try {
+    if (await isAiEnabledForSession(req)) return next();
+    return res.status(403).json({
+      success: false,
+      code: "AI_DISABLED",
+      message: "El análisis con IA está desactivado para esta organización.",
+    });
+  } catch (error) {
+    console.error("❌ Error comprobando aiEnabled:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+}
+
+// Estado de la IA para la organización de la sesión. Lo consultan el
+// dashboard y el comparativo para mostrar u ocultar los botones de análisis.
+app.get("/api/organization/ai-status", async (req, res) => {
+  try {
+    const aiEnabled = await isAiEnabledForSession(req);
+    return res.status(200).json({ success: true, aiEnabled });
+  } catch (error) {
+    console.error("❌ Error en GET /api/organization/ai-status:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Activar / desactivar el uso de IA en una organización (sólo administrador).
+app.post("/api/organization/ai", requireAdmin, async (req, res) => {
+  try {
+    const { orgId, aiEnabled } = req.body;
+
+    if (!orgId || typeof aiEnabled !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "orgId y aiEnabled (boolean) son requeridos.",
+      });
+    }
+
+    const orgDoc = await findOrgDoc(orgId);
+    if (!orgDoc) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Organización no encontrada." });
+    }
+
+    await orgDoc.ref.set({ aiEnabled }, { merge: true });
+
+    logEvent({
+      type: EVENT.ORG_AI_CHANGED,
+      req,
+      target: orgDoc.id,
+      orgname: orgDoc.data().orgname || null,
+      orgId: orgDoc.id,
+      message: `Uso de IA ${aiEnabled ? "activado" : "desactivado"}.`,
+      detail: { aiEnabled },
+    });
+
+    return res.status(200).json({
+      success: true,
+      aiEnabled,
+      message: `Uso de IA ${aiEnabled ? "activado" : "desactivado"} exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/organization/ai:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      detail: error.message,
+    });
+  }
+});
+
+// ==================== Restablecimiento de contraseña ====================
+// Flujo: se emite un token de un solo uso (utils/passwordReset.js), se envía
+// por correo un enlace a /reset-password del dashboard y, con ese token, el
+// usuario fija una contraseña nueva sin haber iniciado sesión.
+//
+// Estos correos NO pasan por el bloqueo de STAGING: son una acción explícita
+// de una persona (como el correo de prueba del admin), no una notificación
+// automática que producción ya haya enviado.
+
+/**
+ * URL base del dashboard para construir el enlace.
+ *
+ * APP_URL manda. Sin ella se usa el Origin de la petición, pero sólo si está
+ * en CORS_ORIGINS: aceptar cualquier Origin permitiría que alguien pidiera un
+ * reseteo para otra persona con un enlace hacia un dominio suyo y capturase el
+ * token cuando la víctima lo abriera.
+ */
+function resolveAppUrl(req) {
+  const configured = (process.env.APP_URL || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) return origin.replace(/\/+$/, "");
+  return null;
+}
+
+/** Emite el token y envía el correo. Lanza si el SMTP falla. */
+async function sendPasswordResetEmail(req, userData, { byAdmin }) {
+  const appUrl = resolveAppUrl(req);
+  if (!appUrl) {
+    const err = new Error(
+      "No se pudo determinar la URL del dashboard. Configure APP_URL en el servidor.",
+    );
+    err.code = "APP_URL_MISSING";
+    throw err;
+  }
+
+  const { token, expiresInMinutes } = await createResetToken(
+    userData.username,
+    byAdmin ? req.auth?.sub || "admin" : "self",
+  );
+  const resetUrl = `${appUrl}/reset-password/?token=${token}`;
+
+  const settings = await getEmailSettings();
+  const template = generateTemplate("passwordreset", {
+    usuario: userData.username,
+    orgname: userData.orgname,
+    resetUrl,
+    byAdmin,
+    expiresInMinutes,
+    settings,
+    lang: userData.preferences?.language,
+  });
+
+  await sendMail({
+    from: settings.from,
+    to: userData.username,
+    subject: template.subject,
+    html: template.html,
+    text: template.text,
+    replyTo: settings.replyTo,
+  });
+}
+
+// Límite de ritmo en memoria para el endpoint público: evita usarlo para
+// inundar de correos un buzón o para sondear qué usuarios existen.
+const PASSWORD_FORGOT_WINDOW_MS = 15 * 60 * 1000;
+const PASSWORD_FORGOT_MAX_PER_IP = 10;
+const PASSWORD_FORGOT_MAX_PER_USER = 3;
+const passwordForgotHits = new Map();
+
+function hitRateLimit(key, max) {
+  const now = Date.now();
+  const hits = (passwordForgotHits.get(key) || []).filter(
+    (ts) => now - ts < PASSWORD_FORGOT_WINDOW_MS,
+  );
+  if (hits.length >= max) {
+    passwordForgotHits.set(key, hits);
+    return true;
+  }
+  hits.push(now);
+  passwordForgotHits.set(key, hits);
+  return false;
+}
+
+// "¿Olvidaste tu contraseña?" desde el login. Siempre responde lo mismo exista
+// o no el usuario, para no revelar qué correos están registrados.
+app.post("/api/password/forgot", async (req, res) => {
+  const genericResponse = {
+    success: true,
+    message:
+      "Si el usuario existe y está activo, recibirá un correo con un enlace para restablecer su contraseña.",
+  };
+
+  try {
+    const username = String(req.body?.username || "").trim();
+    if (!username) {
+      return res
+        .status(400)
+        .json({ success: false, message: "El usuario es requerido." });
+    }
+
+    const ip =
+      String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.socket?.remoteAddress ||
+      "unknown";
+    if (
+      hitRateLimit(`ip:${ip}`, PASSWORD_FORGOT_MAX_PER_IP) ||
+      hitRateLimit(`user:${username.toLowerCase()}`, PASSWORD_FORGOT_MAX_PER_USER)
+    ) {
+      return res.status(429).json({
+        success: false,
+        code: "RATE_LIMITED",
+        message: "Demasiadas solicitudes. Inténtalo de nuevo en unos minutos.",
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(username).get();
+    if (!userDoc.exists || userDoc.data().active === false) {
+      logEvent({
+        type: EVENT.PASSWORD_RESET_REQUESTED,
+        req,
+        username,
+        success: false,
+        message: userDoc.exists
+          ? "Solicitud de restablecimiento para un usuario desactivado."
+          : "Solicitud de restablecimiento para un usuario inexistente.",
+      });
+      return res.status(200).json(genericResponse);
+    }
+
+    const userData = { ...userDoc.data(), username };
+    await sendPasswordResetEmail(req, userData, { byAdmin: false });
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_REQUESTED,
+      req,
+      username,
+      orgname: userData.orgname || null,
+      orgId: userData.orgId || null,
+      role: userData.role || null,
+      success: true,
+      message: "Enlace de restablecimiento enviado (solicitado desde el login).",
+    });
+
+    return res.status(200).json(genericResponse);
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/forgot:", error.message);
+    // El fallo de SMTP no se oculta tras la respuesta genérica: el usuario
+    // quedaría esperando un correo que nunca llega.
+    return res.status(502).json({
+      success: false,
+      code: error.code || "SEND_FAILED",
+      message: "No se pudo enviar el correo. Inténtalo más tarde o contacta al administrador.",
+    });
+  }
+});
+
+// El administrador envía al usuario el enlace para que fije una contraseña nueva.
+app.post("/api/password/reset-request", requireAdmin, async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim();
+    if (!username) {
+      return res
+        .status(400)
+        .json({ success: false, message: "username es requerido." });
+    }
+
+    const userDoc = await db.collection("users").doc(username).get();
+    if (!userDoc.exists) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Usuario no encontrado." });
+    }
+
+    const userData = { ...userDoc.data(), username };
+    await sendPasswordResetEmail(req, userData, { byAdmin: true });
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_REQUESTED,
+      req,
+      target: username,
+      orgname: userData.orgname || null,
+      orgId: userData.orgId || null,
+      success: true,
+      message: `El administrador envió un enlace de restablecimiento a "${username}".`,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Se envió a ${username} un enlace para restablecer su contraseña.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/reset-request:", error.message);
+    return res.status(error.code === "APP_URL_MISSING" ? 500 : 502).json({
+      success: false,
+      code: error.code || "SEND_FAILED",
+      message:
+        error.code === "APP_URL_MISSING"
+          ? error.message
+          : `No se pudo enviar el correo: ${error.message}`,
+    });
+  }
+});
+
+// La página /reset-password comprueba el token antes de mostrar el formulario.
+app.get("/api/password/reset/validate", async (req, res) => {
+  try {
+    const reset = await findValidReset(String(req.query.token || ""));
+    if (!reset) {
+      return res.status(200).json({ success: true, valid: false });
+    }
+    return res.status(200).json({
+      success: true,
+      valid: true,
+      username: reset.data.username,
+      minPasswordLength: MIN_PASSWORD_LENGTH,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/password/reset/validate:", error.message);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Fija la contraseña nueva con el token del correo.
+app.post("/api/password/reset", async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+
+    const policyError = passwordPolicyError(password);
+    if (policyError) {
+      return res
+        .status(400)
+        .json({ success: false, code: "WEAK_PASSWORD", message: policyError });
+    }
+
+    const reset = await findValidReset(String(token || ""));
+    if (!reset) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "El enlace no es válido o ha caducado. Solicita uno nuevo.",
+      });
+    }
+
+    const { username } = reset.data;
+    const userRef = db.collection("users").doc(username);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists || userDoc.data().active === false) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "El enlace no es válido o ha caducado. Solicita uno nuevo.",
+      });
+    }
+
+    await userRef.set(
+      { passwordHash: await bcrypt.hash(password, 10), passwordChangedAt: Date.now() },
+      { merge: true },
+    );
+    await reset.ref.set({ usedAt: Date.now() }, { merge: true });
+    // Cualquier otro enlace pendiente del mismo usuario deja de servir.
+    await invalidatePending(username);
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_COMPLETED,
+      req,
+      username,
+      orgname: userDoc.data().orgname || null,
+      orgId: userDoc.data().orgId || null,
+      role: userDoc.data().role || null,
+      success: true,
+      message: "Contraseña restablecida mediante enlace.",
+      detail: { solicitadoPor: reset.data.requestedBy },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Contraseña actualizada. Ya puedes iniciar sesión.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/reset:", error.message);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
   }
 });
 
