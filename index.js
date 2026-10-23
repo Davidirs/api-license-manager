@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const platformClient = require("purecloud-platform-client-v2");
 
 const app = express();
@@ -69,6 +70,10 @@ app.use((err, req, res, next) => {
 
 app.use(express.json());
 
+// Toda respuesta 5xx se notifica al contacto de alertas de la plataforma.
+const { serverErrorMonitor, notifyPlatformError } = require("./utils/platformAlerts");
+app.use(serverErrorMonitor);
+
 // Health check público, útil para el balanceador y para diagnosticar la config.
 app.get("/api/health", (req, res) => {
   res.json({
@@ -101,7 +106,16 @@ const {
 } = require("./utils/appSettings");
 // Envío de correo por SMTP (IONOS). Sustituye a Resend.
 const { sendMail, verifyTransport, smtpConfig } = require("./utils/mailer");
-const { fetchOrgToken } = require("./utils/genesysRegions");
+const { fetchOrgToken, isKnownRegion } = require("./utils/genesysRegions");
+const { fetchOutboundCampaignAttempts } = require("./services/genesysBilling");
+// KPIs del informe y fair use (BYOC, outbound, IVR) calculados en el servidor.
+const {
+  buildLicensingReport,
+  calcularKpis,
+  resumenFairUse,
+  clientDataConFairUse,
+  DEFAULT_TIMEZONE: REPORT_DEFAULT_TIMEZONE,
+} = require("./services/licensingReport");
 // Registro de conexión y acceso (colección Firestore `accessLogs`).
 const {
   EVENT,
@@ -116,6 +130,13 @@ const { notificationsBlocked, blockedReason, currentEnv } = require("./utils/env
 const { normalizeLanguage, SUPPORTED_LANGUAGES } = require("./utils/emailI18n");
 const { promptsFor, languageRule, numbered } = require("./utils/aiPrompts");
 const { languageForRecipients, forgetRecipient } = require("./utils/userLanguage");
+const {
+  MIN_PASSWORD_LENGTH,
+  createResetToken,
+  findValidReset,
+  invalidatePending,
+  passwordPolicyError,
+} = require("./utils/passwordReset");
 
 /**
  * Guard para endpoints administrativos que pueden disparar envíos masivos.
@@ -155,6 +176,31 @@ function withNormalizedLanguage(preferences) {
   const prefs = preferences && typeof preferences === "object" ? { ...preferences } : {};
   prefs.language = normalizeLanguage(prefs.language);
   return prefs;
+}
+
+/**
+ * El número de WhatsApp y su verificación los gestiona sólo el servidor
+ * (/api/whatsapp/verification/*): se descarta lo que mande el front y se
+ * conserva lo guardado. Además se sanean el horario de no molestar y las
+ * plantillas elegidas por el usuario.
+ */
+function withServerManagedWhatsapp(prefs, storedPrefs) {
+  const next = { ...prefs };
+  const stored = storedPrefs || {};
+  next.whatsappRecipients = Array.isArray(stored.whatsappRecipients) ? stored.whatsappRecipients : [];
+  next.whatsappVerifiedAt = stored.whatsappVerifiedAt || null;
+  if (!next.whatsappVerifiedAt) next.whatsappNotifications = false;
+  if (next.whatsappQuietHours !== undefined) {
+    next.whatsappQuietHours = sanitizeQuietHours(next.whatsappQuietHours);
+  }
+  if (next.whatsappTemplates !== undefined) {
+    const clean = {};
+    for (const key of WHATSAPP_TEMPLATES) {
+      if (typeof next.whatsappTemplates?.[key] === "boolean") clean[key] = next.whatsappTemplates[key];
+    }
+    next.whatsappTemplates = clean;
+  }
+  return next;
 }
 
 // Helper para obtener token internamente.
@@ -479,6 +525,10 @@ app.post("/api/login", async (req, res) => {
       userResponse.orgId = targetOrgData.orgId || targetOrgDoc.id;
       userResponse.region = targetOrgData.region || userFound.region;
       userResponse.orgToken = orgToken;
+      // Si la organización permite el análisis con IA (ver /api/organization/ai).
+      userResponse.aiEnabled = targetOrgData.aiEnabled !== false;
+      // Si la organización tiene habilitadas las notificaciones por WhatsApp.
+      userResponse.whatsappEnabled = isOrgWhatsappEnabled(targetOrgData);
 
       console.log(
         `🏢 Org encontrada: ${orgname} | orgId: ${userResponse.orgId} | orgToken generado: ${!!orgToken}`,
@@ -641,6 +691,28 @@ app.post("/api/token", requireAdmin, async (req, res) => {
 const { initCron, runDailyMonitor } = require("./services/cronOrchestrator");
 const { getMonitorHealth } = require("./services/monitorQueue");
 const { getQueueHealth } = require("./services/emailQueue");
+const { getWhatsappQueueHealth } = require("./services/whatsappQueue");
+const {
+  WHATSAPP_TEMPLATES,
+  MAX_NUMBERS_PER_USER,
+  getWhaibotConfig,
+  invalidateWhaibotCache,
+  isConfigured: isWhaibotConfigured,
+  isIntegrationEnabled: isWhaibotEnabled,
+  resolveTemplates: resolveWhatsappTemplates,
+  sanitizeTemplates: sanitizeWhatsappTemplates,
+  isOrgWhatsappEnabled,
+  normalizeNumbers,
+  sendWhaibotMessage,
+  resolveDailyLimit,
+} = require("./utils/whaibot");
+const { whatsappText } = require("./utils/whatsappMessages");
+const { sanitizeQuietHours } = require("./utils/quietHours");
+const {
+  getPlatformAlertSettings,
+  savePlatformAlertSettings,
+  deliverAlert,
+} = require("./utils/platformAlerts");
 
 // Iniciar el servidor
 app.listen(port, () => {
@@ -653,7 +725,7 @@ app.listen(port, () => {
 app.post("/api/monitor/run", async (req, res) => {
   if (!requireAdminToken(req, res)) return;
 
-  console.log("▶️ Forzando ejecución del monitor desde endpoint administrativo...");
+  console.log(`[${new Date().toISOString()}] ▶️ Forzando ejecución manual del monitor desde endpoint administrativo...`);
   logEvent({
     type: EVENT.MONITOR_RUN,
     req,
@@ -661,7 +733,7 @@ app.post("/api/monitor/run", async (req, res) => {
     detail: { entorno: currentEnv(), notificacionesBloqueadas: notificationsBlocked() },
   });
   runDailyMonitor().catch((err) =>
-    console.error("❌ Ejecución manual del monitor falló:", err.message),
+    console.error(`[${new Date().toISOString()}] ❌ Ejecución manual del monitor falló:`, err.message),
   );
   return res.json({
     success: true,
@@ -674,7 +746,11 @@ app.get("/api/monitor/health", async (req, res) => {
   if (!requireAdminToken(req, res)) return;
 
   try {
-    const [monitor, emails] = await Promise.all([getMonitorHealth(), getQueueHealth()]);
+    const [monitor, emails, whatsapp] = await Promise.all([
+      getMonitorHealth(),
+      getQueueHealth(),
+      getWhatsappQueueHealth(),
+    ]);
 
     const orgsSnapshot = await db.collection("organizations").get();
     const conProblemas = [];
@@ -692,7 +768,7 @@ app.get("/api/monitor/health", async (req, res) => {
 
     return res.json({
       success: true,
-      queues: { monitor, emails },
+      queues: { monitor, emails, whatsapp },
       organizacionesConError: conProblemas,
     });
   } catch (error) {
@@ -1084,6 +1160,100 @@ app.post("/api/billing/periods", async (req, res) => {
     });
   }
 });
+
+// Tokens de Genesys de las organizaciones resueltas desde la sesión.
+const sessionOrgTokenCache = new Map();
+
+/**
+ * Token y región de Genesys de la organización de la sesión (la del JWT), con
+ * las credenciales OAuth guardadas en Firestore, igual que en el login.
+ */
+async function genesysAccessForSession(req) {
+  let orgDoc = await findOrgDoc(req.auth?.orgId);
+  if (!orgDoc && req.auth?.orgname) {
+    const snapshot = await db
+      .collection("organizations")
+      .where("orgname", "==", req.auth.orgname)
+      .limit(1)
+      .get();
+    if (!snapshot.empty) orgDoc = snapshot.docs[0];
+  }
+
+  const org = orgDoc?.data();
+  if (!org || !org.clientId || !org.clientSecret) {
+    const error = new Error("La organización de la sesión no tiene credenciales de Genesys configuradas.");
+    error.status = 404;
+    error.expose = true;
+    throw error;
+  }
+
+  const region = org.region || "us-east-1";
+  const cacheKey = `${orgDoc.id}:${org.clientId}:${region}`;
+  const cached = sessionOrgTokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { token: cached.accessToken, region };
+  }
+  const fresh = await fetchOrgToken(org.clientId, org.clientSecret, region);
+  sessionOrgTokenCache.set(cacheKey, fresh);
+  return { token: fresh.accessToken, region };
+}
+
+/**
+ * KPIs del informe mensual de licenciamiento, calculados en el servidor con las
+ * reglas de fair use del dashboard (ver services/licensingReport.js).
+ *
+ * Parámetros (query en GET, cuerpo en POST):
+ *  - endDate: "previous" (por defecto), "current", timestamp en ms o fecha.
+ *  - timezone: zona para contar los intentos outbound (America/Mexico_City).
+ *  - outbound: "false" para no consultar Analytics (outbound sale null).
+ *  - accessToken + region: opcionales; sin ellos se usa la organización de la
+ *    sesión con sus credenciales de Firestore.
+ *
+ * Respuesta: { success, region, periodEndingTimestamp, timezone, kpis, alertas,
+ * outboundError }. `kpis` y `alertas` tienen la forma de `calcular_kpis` y
+ * `alertas` de informes_mensuales.
+ */
+async function licensingReportHandler(req, res) {
+  res.set("Cache-Control", "no-store");
+  try {
+    const params = { ...req.query, ...(req.body || {}) };
+
+    if (params.region && !isKnownRegion(params.region)) {
+      return res.status(400).json({ success: false, error: "Región no válida o no soportada." });
+    }
+
+    const access = params.accessToken
+      ? { token: params.accessToken, region: params.region || "us-east-1" }
+      : await genesysAccessForSession(req);
+
+    const report = await buildLicensingReport({
+      token: access.token,
+      region: access.region,
+      endDate: String(params.endDate || "previous"),
+      timezone: params.timezone || REPORT_DEFAULT_TIMEZONE,
+      includeOutbound: !["false", "0", false, 0].includes(params.outbound),
+    });
+
+    return res.status(200).json({ success: true, ...report });
+  } catch (error) {
+    console.error("❌ Error en /api/report/licensing:", error?.message || error);
+    // Los errores propios (parámetros, período) se devuelven tal cual; los de
+    // Genesys como 502 para que el front no los confunda con la sesión.
+    const status = error.expose
+      ? error.status
+      : error.name === "AbortError"
+        ? 504
+        : 502;
+    return res.status(status).json({
+      success: false,
+      error: error.message || "Error interno del servidor",
+      genesysStatus: error.expose ? undefined : error.status,
+    });
+  }
+}
+
+app.get("/api/report/licensing", licensingReportHandler);
+app.post("/api/report/licensing", licensingReportHandler);
 
 // Endpoint para obtener Billable Usage (Uso Facturable)
 app.post("/api/billableusage", async (req, res) => {
@@ -1995,7 +2165,7 @@ app.get("/api/reports/ia-tokens-daily", async (req, res) => {
 });
 
 // Helper para invocar servicio de IA (DeepSeek por defecto, con soporte configurable / fallback a Groq)
-async function callAiChatCompletion({ systemPrompt, userPrompt }) {
+async function callAiChatCompletion({ systemPrompt, userPrompt, maxTokens }) {
   const deepseekApiKey = (process.env.DEEPSEEK_API_KEY || "").trim();
   const groqApiKey = (process.env.GROQ_API_KEY || "").trim();
 
@@ -2020,7 +2190,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
       thinking: {
         type: process.env.DEEPSEEK_THINKING === 'true' ? 'enabled' : 'disabled'
       },
-      max_tokens: 4000
+      max_tokens: maxTokens || 4000
     };
   } else {
     endpoint = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
@@ -2034,7 +2204,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
         { role: 'user', content: userPrompt }
       ],
       temperature: 0.7,
-      max_tokens: 2000
+      max_tokens: maxTokens || 2000
     };
   }
 
@@ -2068,7 +2238,7 @@ async function callAiChatCompletion({ systemPrompt, userPrompt }) {
 }
 
 // Endpoint para analizar métricas con IA (DeepSeek / Groq)
-app.post("/api/analyze-metrics", async (req, res) => {
+app.post("/api/analyze-metrics", requireAiEnabled, async (req, res) => {
   try {
     const { clientData, dailyLogins, outboundAttempts, overageDetailsText, lang, languageName } = req.body;
 
@@ -2080,26 +2250,62 @@ app.post("/api/analyze-metrics", async (req, res) => {
     const idiomaAnalisis = lang || languageName;
     const p = promptsFor(idiomaAnalisis);
 
-    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un resumen ejecutivo con insights clave, estado de KPIs, y recomendaciones específicas.
+    // Fair use calculado aquí, con las mismas reglas que /api/report/licensing.
+    // Sin él la IA veía el consumo de BYOC sin prepago (overageQuantity = todo
+    // lo usado) y lo presentaba como sobreuso aunque estuviera dentro del fair
+    // use de las licencias. Si los datos no tienen la forma esperada, el
+    // análisis sigue como antes, sin este bloque.
+    let fairUse = null;
+    let datosCliente = clientData;
+    try {
+      if (clientData) {
+        const kpis = calcularKpis(clientData, outboundAttempts || null);
+        fairUse = resumenFairUse(kpis);
+        datosCliente = clientDataConFairUse(clientData, kpis);
+      }
+    } catch (fairUseError) {
+      console.warn("⚠️ [analyze-metrics] No se pudo calcular el fair use:", fairUseError.message);
+    }
+
+    const systemPrompt = `Eres un experto analista de métricas de Genesys Cloud CX. Analiza los datos proporcionados y genera un análisis sumamente conciso, directo y breve.
 
 ${languageRule(idiomaAnalisis)}
 
-REGLAS DE FORMATO OBLIGATORIAS:
-1. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto del análisis.
-2. Para las listas y puntos, utiliza "1.- " para números o "- " para viñetas, nunca uses "*".
-3. En la sección de Recomendaciones, debes sugerir explícitamente que a través de la opción de "Último Login" (en Conexiones Diarias) el administrador puede detectar usuarios inactivos que no han iniciado sesión en los últimos meses. Recomienda desactivar estas cuentas en la organización de Genesys Cloud para evitar que por algún motivo inicien sesión por error y consuman licencias innecesarias de la organización.
-4. Si se proporciona información de sobreuso de licencias, analízala indicando en qué licencias se excedió el compromiso y en cuánto, y qué implica ese exceso.
-5. Los datos que recibes son agregados y NO incluyen identidades de agentes. No inventes ni menciones nombres, correos, divisiones ni fechas de inicio de sesión de personas concretas: si el análisis requiere ese detalle, remite al reporte de "Último Login" del panel.`;
+REGLAS DE FORMATO Y ESTRUCTURA OBLIGATORIAS:
+1. El análisis debe contener ÚNICAMENTE las siguientes 3 secciones (sin secciones adicionales, sin recomendaciones largas ni texto de relleno):
 
-    // Los encabezados van ya en el idioma de salida: si se piden en español, el
-    // modelo los copia literalmente y devuelve títulos en español dentro de un
-    // análisis en otro idioma.
+${p.sectionSummary}:
+Un único párrafo corto (máximo 3 a 5 líneas) resumiendo la organización, período de facturación, uso general de licencias indicando si hubo sobreuso frente a lo prepagado, y una breve mención de recursos como almacenamiento, tokens de IA e intentos de salida.
+
+${p.sectionKpis}:
+Una lista de viñetas con guion "- ", con exactamente una línea concisa por cada KPI:
+- ${p.kpiLicenses}: [resumen de 1 frase del uso vs prepagadas y si hay exceso o está dentro del límite]
+- ${p.kpiResources}: [resumen de 1 frase de unidades utilizadas vs límite comprometido]
+- ${p.kpiStorage}: [resumen de 1 frase de almacenamiento disponible o utilizado]
+- ${p.kpiAiTokens}: [resumen de 1 frase de tokens utilizados vs límite incluido]
+- ${p.kpiOutbound}: [resumen de 1 frase de total de intentos de salida distribuidos en campañas]
+
+${p.sectionAlerts}:
+Una lista de viñetas con guion "- ":
+- Si hay sobreuso: una viñeta indicando la licencia y cantidad de usuarios excedidos, y si aplica, otra viñeta indicando que los últimos usuarios que consumieron licencias corresponden a los mencionados en la sección de detalles de sobreuso y últimos inicios de sesión.
+- Si no hay sobreuso: una sola viñeta indicando que no se ha detectado sobreuso de licencias ni de recursos.
+
+2. No uses negritas (**texto**) en ningún lugar, ni en los títulos ni en el cuerpo del texto.
+3. Los encabezados de sección deben ir exactamente con el título seguido de dos puntos (ejemplo "${p.sectionSummary}:", "${p.sectionKpis}:", "${p.sectionAlerts}:"), sin números.
+4. Para las viñetas utiliza únicamente el guion "- ", nunca asteriscos "*".
+5. Los datos que recibes son agregados y no incluyen identidades de agentes. No inventes nombres, correos ni datos personales.
+6. Mantén la extensión total muy corta, semejante a 3 párrafos o bloques breves.${fairUse ? `
+7. Genesys Cloud BYOC Cloud y los intentos outbound no se miden contra lo prepagado, sino contra el fair use incluido en las licencias, que recibes ya calculado en la sección de fair use. Solo hay sobreuso si su "excedente" es mayor que 0; si "dentro_del_fair_use" es true, di que el consumo está dentro del fair use y no lo presentes como sobreuso ni lo incluyas en ${p.sectionAlerts}. Usa esas cifras tal cual, sin recalcularlas.` : ""}`;
+
+    // Los datos y encabezados en el idioma correspondiente
     const userPrompt = `${p.metricsIntro}
-${numbered(p.metricsSections)}
 
 ${p.metricsLicenses}
-${JSON.stringify(clientData, null, 2)}
-
+${JSON.stringify(datosCliente, null, 2)}
+${fairUse ? `
+${p.metricsFairUse}
+${JSON.stringify(fairUse, null, 2)}
+` : ""}
 ${p.metricsLogins}
 ${JSON.stringify(dailyLogins, null, 2)}
 
@@ -2109,7 +2315,7 @@ ${JSON.stringify(outboundAttempts, null, 2)}
 ${p.metricsOverage}
 ${overageDetailsText || p.metricsNoOverage}`;
 
-    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt });
+    const aiText = await callAiChatCompletion({ systemPrompt, userPrompt, maxTokens: 1000 });
     if (!aiText) {
       return res.status(502).json({ success: false, code: "EMPTY_AI_RESPONSE" });
     }
@@ -2125,8 +2331,9 @@ ${overageDetailsText || p.metricsNoOverage}`;
   }
 });
 
+
 // Endpoint para analizar comparativa entre periodos con IA
-app.post("/api/analyze-comparison", async (req, res) => {
+app.post("/api/analyze-comparison", requireAiEnabled, async (req, res) => {
   try {
     const { kpiData, selectedCategories, kpiName, lang, languageName } = req.body;
 
@@ -2194,83 +2401,17 @@ app.get("/api/reports/outbound-attempts", async (req, res) => {
 
     const url = getRegionUrl(region);
 
-    let offsetStart = "Z";
-    let offsetEnd = "Z";
-    if (timezone) {
-      try {
-        const formatterStart = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
-        const tzStrStart = formatterStart.formatToParts(new Date(`${startDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
-        offsetStart = tzStrStart.replace("GMT", "");
-        if (offsetStart === "") offsetStart = "Z";
+    // El cálculo (intervalo, filtro y recuento) es el mismo que usa
+    // /api/report/licensing: vive en services/genesysBilling.js.
+    const { totalAttempts, campaigns } = await fetchOutboundCampaignAttempts(
+      accessToken,
+      region,
+      startDate,
+      endDate,
+      timezone,
+    );
 
-        const formatterEnd = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
-        const tzStrEnd = formatterEnd.formatToParts(new Date(`${endDate}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
-        offsetEnd = tzStrEnd.replace("GMT", "");
-        if (offsetEnd === "") offsetEnd = "Z";
-      } catch (e) {
-        console.error("Error al calcular timezone offset", e);
-      }
-    }
-
-    const interval = `${startDate}T00:00:00.000${offsetStart}/${endDate}T23:59:59.999${offsetEnd}`;
-
-    const payload = {
-      interval: interval,
-      groupBy: ["outboundCampaignId"],
-      metrics: ["nOutboundAttempted"],
-      filter: {
-        type: "and",
-        predicates: [
-          {
-            type: "dimension",
-            dimension: "direction",
-            operator: "matches",
-            value: "outbound"
-          }
-        ]
-      }
-    };
-
-    const response = await fetch(`${url}/api/v2/analytics/conversations/aggregates/query`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Genesys API error: ${response.status} - ${errText}`);
-    }
-
-    const genesysResponse = await response.json();
-    let totalAttempts = 0;
-    const campaigns = [];
-
-    if (genesysResponse.results) {
-      // Collect campaigns and count total
-      for (const result of genesysResponse.results) {
-        const campaignId = result.group?.outboundCampaignId;
-        if (!campaignId) continue;
-
-        let count = 0;
-        if (result.data && result.data[0] && result.data[0].metrics) {
-          const metricObj = result.data[0].metrics.find(m => m.metric === "nOutboundAttempted");
-          if (metricObj && metricObj.stats) {
-            count = metricObj.stats.count || 0;
-          }
-        }
-
-        totalAttempts += count;
-        campaigns.push({
-          id: campaignId,
-          name: campaignId, // fallback to ID
-          attempts: count
-        });
-      }
-
+    if (campaigns.length > 0) {
       // Try to fetch campaign names in parallel
       try {
         await Promise.all(campaigns.map(async (camp) => {
@@ -2500,13 +2641,22 @@ app.post("/api/setuser", async (req, res) => {
           {
             orgId: orgId,
             orgname: orgname,
-            thrusted: body.thrusted || userToCreate.thrusted || "N/A",
+            thrusted:
+              body.thrusted ||
+              (Array.isArray(userToCreate.thrusted)
+                ? userToCreate.thrusted[0]
+                : userToCreate.thrusted) ||
+              "N/A",
             region: body.region || userToCreate.region || "us-east-1",
             clientId: body.clientId || userToCreate.clientId || "",
             clientSecret: body.clientSecret || userToCreate.clientSecret || "",
             criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
             // Preservar el estado 'active' existente; por defecto activa.
             active: orgDoc.exists ? orgDoc.data().active ?? true : true,
+            // Uso de IA: se preserva el existente; activo por defecto.
+            aiEnabled: orgDoc.exists ? orgDoc.data().aiEnabled ?? true : true,
+            // WhatsApp es opt-in: las organizaciones nuevas nacen sin él.
+            whatsappEnabled: orgDoc.exists ? orgDoc.data().whatsappEnabled === true : false,
           },
           { merge: true },
         );
@@ -2517,7 +2667,10 @@ app.post("/api/setuser", async (req, res) => {
         username: cleanUsername,
         passwordHash: passwordHash,
         role: userToCreate.role || "client",
-        thrusted: userToCreate.thrusted || body.thrusted || "N/A",
+        thrusted:
+          userToCreate.thrusted !== undefined
+            ? userToCreate.thrusted
+            : body.thrusted || "N/A",
         orgname: orgname,
         orgId: orgId,
         clientId: userToCreate.clientId || body.clientId || (orgDoc.exists ? orgDoc.data().clientId : "") || "",
@@ -2526,7 +2679,7 @@ app.post("/api/setuser", async (req, res) => {
         // El idioma se elige al crear el usuario y decide en qué idioma se le
         // renderizan la interfaz y las plantillas de correo. Sin selección,
         // español.
-        preferences: withNormalizedLanguage(userToCreate.preferences),
+        preferences: withServerManagedWhatsapp(withNormalizedLanguage(userToCreate.preferences), null),
         // Los usuarios nuevos se crean activos por defecto.
         active: true,
       };
@@ -2568,7 +2721,10 @@ app.post("/api/setuser", async (req, res) => {
 
         updates = { ...safeUserFields, orgname };
         if (safeUserFields.preferences && typeof safeUserFields.preferences === "object") {
-          updates.preferences = withNormalizedLanguage(safeUserFields.preferences);
+          updates.preferences = withServerManagedWhatsapp(
+            withNormalizedLanguage(safeUserFields.preferences),
+            userDoc.exists ? userDoc.data().preferences : null,
+          );
         }
         if (orgId) {
           updates.orgId = orgId;
@@ -2580,7 +2736,10 @@ app.post("/api/setuser", async (req, res) => {
         // o reactivarse tras ser dado de baja.
         updates = {};
         if (userToCreate.preferences && typeof userToCreate.preferences === "object") {
-          updates.preferences = withNormalizedLanguage(userToCreate.preferences);
+          updates.preferences = withServerManagedWhatsapp(
+            withNormalizedLanguage(userToCreate.preferences),
+            userDoc.exists ? userDoc.data().preferences : null,
+          );
         }
       }
 
@@ -2637,8 +2796,17 @@ app.post("/api/setuser", async (req, res) => {
 app.post("/api/organization", requireAdmin, async (req, res) => {
   try {
     const body = req.body;
-    const { orgId, orgname, thrusted, region, clientId, clientSecret, active } =
-      body;
+    const {
+      orgId,
+      orgname,
+      thrusted,
+      region,
+      clientId,
+      clientSecret,
+      active,
+      aiEnabled,
+      whatsappEnabled,
+    } = body;
 
     if (!orgId || !orgname) {
       return res.status(400).json({
@@ -2660,6 +2828,23 @@ app.post("/api/organization", requireAdmin, async (req, res) => {
           ? orgDoc.data().active ?? true
           : true;
 
+    // Uso de IA: igual que 'active'. Las organizaciones nuevas nacen con la
+    // IA activa; el administrador puede desactivarla después.
+    const resolvedAiEnabled =
+      typeof aiEnabled === "boolean"
+        ? aiEnabled
+        : orgDoc.exists
+          ? orgDoc.data().aiEnabled ?? true
+          : true;
+
+    // WhatsApp: al revés que la IA, las organizaciones nuevas nacen sin él.
+    const resolvedWhatsappEnabled =
+      typeof whatsappEnabled === "boolean"
+        ? whatsappEnabled
+        : orgDoc.exists
+          ? orgDoc.data().whatsappEnabled === true
+          : false;
+
     await orgRef.set(
       {
         orgId: cleanOrgId,
@@ -2670,6 +2855,8 @@ app.post("/api/organization", requireAdmin, async (req, res) => {
         clientSecret: clientSecret || "",
         criticalMetrics: orgDoc.exists ? orgDoc.data().criticalMetrics || [] : [],
         active: resolvedActive,
+        aiEnabled: resolvedAiEnabled,
+        whatsappEnabled: resolvedWhatsappEnabled,
       },
       { merge: true },
     );
@@ -2802,6 +2989,441 @@ app.post("/api/user/status", requireAdmin, async (req, res) => {
       message: "Error interno del servidor",
       detail: error.message,
     });
+  }
+});
+
+// ==================== Uso de IA por organización ====================
+// El análisis con IA (botón flotante del dashboard y análisis del comparativo)
+// envía métricas agregadas a un proveedor externo (DeepSeek / Groq). Una
+// organización puede no querer compartir datos con terceros, así que el
+// administrador puede desactivarlo.
+//
+// Convención igual que `active`: si el campo `aiEnabled` falta, la IA está
+// activa; sólo `aiEnabled === false` la desactiva.
+
+/** Documento de una organización por id (con respaldo por el campo `orgId`). */
+async function findOrgDoc(orgId) {
+  if (!orgId) return null;
+  const clean = String(orgId).trim();
+  const direct = await db.collection("organizations").doc(clean).get();
+  if (direct.exists) return direct;
+  const snapshot = await db
+    .collection("organizations")
+    .where("orgId", "==", clean)
+    .limit(1)
+    .get();
+  return snapshot.empty ? null : snapshot.docs[0];
+}
+
+/**
+ * ¿Puede la sesión actual usar la IA? Se decide por la organización de la
+ * sesión (la del JWT), no por lo que mande el navegador.
+ */
+async function isAiEnabledForSession(req) {
+  const orgDoc = await findOrgDoc(req.auth?.orgId);
+  // Sin organización resoluble se mantiene el comportamiento previo (activa).
+  if (!orgDoc) return true;
+  return orgDoc.data().aiEnabled !== false;
+}
+
+/** Middleware para los endpoints que llaman al proveedor de IA. */
+async function requireAiEnabled(req, res, next) {
+  try {
+    if (await isAiEnabledForSession(req)) return next();
+    return res.status(403).json({
+      success: false,
+      code: "AI_DISABLED",
+      message: "El análisis con IA está desactivado para esta organización.",
+    });
+  } catch (error) {
+    console.error("❌ Error comprobando aiEnabled:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+}
+
+// Estado de la IA para la organización de la sesión. Lo consultan el
+// dashboard y el comparativo para mostrar u ocultar los botones de análisis.
+app.get("/api/organization/ai-status", async (req, res) => {
+  try {
+    const aiEnabled = await isAiEnabledForSession(req);
+    return res.status(200).json({ success: true, aiEnabled });
+  } catch (error) {
+    console.error("❌ Error en GET /api/organization/ai-status:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Activar / desactivar las notificaciones por WhatsApp de una organización
+// (sólo administrador). Opt-in: sin el campo, la organización no tiene WhatsApp.
+app.post("/api/organization/whatsapp", requireAdmin, async (req, res) => {
+  try {
+    const { orgId, whatsappEnabled } = req.body;
+
+    if (!orgId || typeof whatsappEnabled !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "orgId y whatsappEnabled (boolean) son requeridos.",
+      });
+    }
+
+    const orgDoc = await findOrgDoc(orgId);
+    if (!orgDoc) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Organización no encontrada." });
+    }
+
+    await orgDoc.ref.set({ whatsappEnabled }, { merge: true });
+
+    logEvent({
+      type: EVENT.ORG_WHATSAPP_CHANGED,
+      req,
+      target: orgDoc.id,
+      orgname: orgDoc.data().orgname || null,
+      orgId: orgDoc.id,
+      message: `Notificaciones por WhatsApp ${whatsappEnabled ? "activadas" : "desactivadas"}.`,
+      detail: { whatsappEnabled },
+    });
+
+    return res.status(200).json({
+      success: true,
+      whatsappEnabled,
+      message: `WhatsApp ${whatsappEnabled ? "activado" : "desactivado"} exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/organization/whatsapp:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Activar / desactivar el uso de IA en una organización (sólo administrador).
+app.post("/api/organization/ai", requireAdmin, async (req, res) => {
+  try {
+    const { orgId, aiEnabled } = req.body;
+
+    if (!orgId || typeof aiEnabled !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "orgId y aiEnabled (boolean) son requeridos.",
+      });
+    }
+
+    const orgDoc = await findOrgDoc(orgId);
+    if (!orgDoc) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Organización no encontrada." });
+    }
+
+    await orgDoc.ref.set({ aiEnabled }, { merge: true });
+
+    logEvent({
+      type: EVENT.ORG_AI_CHANGED,
+      req,
+      target: orgDoc.id,
+      orgname: orgDoc.data().orgname || null,
+      orgId: orgDoc.id,
+      message: `Uso de IA ${aiEnabled ? "activado" : "desactivado"}.`,
+      detail: { aiEnabled },
+    });
+
+    return res.status(200).json({
+      success: true,
+      aiEnabled,
+      message: `Uso de IA ${aiEnabled ? "activado" : "desactivado"} exitosamente.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/organization/ai:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error interno del servidor",
+      detail: error.message,
+    });
+  }
+});
+
+// ==================== Restablecimiento de contraseña ====================
+// Flujo: se emite un token de un solo uso (utils/passwordReset.js), se envía
+// por correo un enlace a /reset-password del dashboard y, con ese token, el
+// usuario fija una contraseña nueva sin haber iniciado sesión.
+//
+// Estos correos NO pasan por el bloqueo de STAGING: son una acción explícita
+// de una persona (como el correo de prueba del admin), no una notificación
+// automática que producción ya haya enviado.
+
+/**
+ * URL base del dashboard para construir el enlace.
+ *
+ * APP_URL manda. Sin ella se usa el Origin de la petición, pero sólo si está
+ * en CORS_ORIGINS: aceptar cualquier Origin permitiría que alguien pidiera un
+ * reseteo para otra persona con un enlace hacia un dominio suyo y capturase el
+ * token cuando la víctima lo abriera.
+ */
+function resolveAppUrl(req) {
+  const configured = (process.env.APP_URL || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) return origin.replace(/\/+$/, "");
+  return null;
+}
+
+/** Emite el token y envía el correo. Lanza si el SMTP falla. */
+async function sendPasswordResetEmail(req, userData, { byAdmin }) {
+  const appUrl = resolveAppUrl(req);
+  if (!appUrl) {
+    const err = new Error(
+      "No se pudo determinar la URL del dashboard. Configure APP_URL en el servidor.",
+    );
+    err.code = "APP_URL_MISSING";
+    throw err;
+  }
+
+  const { token, expiresInMinutes } = await createResetToken(
+    userData.username,
+    byAdmin ? req.auth?.sub || "admin" : "self",
+  );
+  const resetUrl = `${appUrl}/reset-password/?token=${token}`;
+
+  const settings = await getEmailSettings();
+  const template = generateTemplate("passwordreset", {
+    usuario: userData.username,
+    orgname: userData.orgname,
+    resetUrl,
+    byAdmin,
+    expiresInMinutes,
+    settings,
+    lang: userData.preferences?.language,
+  });
+
+  await sendMail({
+    from: settings.from,
+    to: userData.username,
+    subject: template.subject,
+    html: template.html,
+    text: template.text,
+    replyTo: settings.replyTo,
+  });
+}
+
+// Límite de ritmo en memoria para el endpoint público: evita usarlo para
+// inundar de correos un buzón o para sondear qué usuarios existen.
+const PASSWORD_FORGOT_WINDOW_MS = 15 * 60 * 1000;
+const PASSWORD_FORGOT_MAX_PER_IP = 10;
+const PASSWORD_FORGOT_MAX_PER_USER = 3;
+const passwordForgotHits = new Map();
+
+function hitRateLimit(key, max) {
+  const now = Date.now();
+  const hits = (passwordForgotHits.get(key) || []).filter(
+    (ts) => now - ts < PASSWORD_FORGOT_WINDOW_MS,
+  );
+  if (hits.length >= max) {
+    passwordForgotHits.set(key, hits);
+    return true;
+  }
+  hits.push(now);
+  passwordForgotHits.set(key, hits);
+  return false;
+}
+
+// "¿Olvidaste tu contraseña?" desde el login. Siempre responde lo mismo exista
+// o no el usuario, para no revelar qué correos están registrados.
+app.post("/api/password/forgot", async (req, res) => {
+  const genericResponse = {
+    success: true,
+    message:
+      "Si el usuario existe y está activo, recibirá un correo con un enlace para restablecer su contraseña.",
+  };
+
+  try {
+    const username = String(req.body?.username || "").trim();
+    if (!username) {
+      return res
+        .status(400)
+        .json({ success: false, message: "El usuario es requerido." });
+    }
+
+    const ip =
+      String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.socket?.remoteAddress ||
+      "unknown";
+    if (
+      hitRateLimit(`ip:${ip}`, PASSWORD_FORGOT_MAX_PER_IP) ||
+      hitRateLimit(`user:${username.toLowerCase()}`, PASSWORD_FORGOT_MAX_PER_USER)
+    ) {
+      return res.status(429).json({
+        success: false,
+        code: "RATE_LIMITED",
+        message: "Demasiadas solicitudes. Inténtalo de nuevo en unos minutos.",
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(username).get();
+    if (!userDoc.exists || userDoc.data().active === false) {
+      logEvent({
+        type: EVENT.PASSWORD_RESET_REQUESTED,
+        req,
+        username,
+        success: false,
+        message: userDoc.exists
+          ? "Solicitud de restablecimiento para un usuario desactivado."
+          : "Solicitud de restablecimiento para un usuario inexistente.",
+      });
+      return res.status(200).json(genericResponse);
+    }
+
+    const userData = { ...userDoc.data(), username };
+    await sendPasswordResetEmail(req, userData, { byAdmin: false });
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_REQUESTED,
+      req,
+      username,
+      orgname: userData.orgname || null,
+      orgId: userData.orgId || null,
+      role: userData.role || null,
+      success: true,
+      message: "Enlace de restablecimiento enviado (solicitado desde el login).",
+    });
+
+    return res.status(200).json(genericResponse);
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/forgot:", error.message);
+    // El fallo de SMTP no se oculta tras la respuesta genérica: el usuario
+    // quedaría esperando un correo que nunca llega.
+    return res.status(502).json({
+      success: false,
+      code: error.code || "SEND_FAILED",
+      message: "No se pudo enviar el correo. Inténtalo más tarde o contacta al administrador.",
+    });
+  }
+});
+
+// El administrador envía al usuario el enlace para que fije una contraseña nueva.
+app.post("/api/password/reset-request", requireAdmin, async (req, res) => {
+  try {
+    const username = String(req.body?.username || "").trim();
+    if (!username) {
+      return res
+        .status(400)
+        .json({ success: false, message: "username es requerido." });
+    }
+
+    const userDoc = await db.collection("users").doc(username).get();
+    if (!userDoc.exists) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Usuario no encontrado." });
+    }
+
+    const userData = { ...userDoc.data(), username };
+    await sendPasswordResetEmail(req, userData, { byAdmin: true });
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_REQUESTED,
+      req,
+      target: username,
+      orgname: userData.orgname || null,
+      orgId: userData.orgId || null,
+      success: true,
+      message: `El administrador envió un enlace de restablecimiento a "${username}".`,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Se envió a ${username} un enlace para restablecer su contraseña.`,
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/reset-request:", error.message);
+    return res.status(error.code === "APP_URL_MISSING" ? 500 : 502).json({
+      success: false,
+      code: error.code || "SEND_FAILED",
+      message:
+        error.code === "APP_URL_MISSING"
+          ? error.message
+          : `No se pudo enviar el correo: ${error.message}`,
+    });
+  }
+});
+
+// La página /reset-password comprueba el token antes de mostrar el formulario.
+app.get("/api/password/reset/validate", async (req, res) => {
+  try {
+    const reset = await findValidReset(String(req.query.token || ""));
+    if (!reset) {
+      return res.status(200).json({ success: true, valid: false });
+    }
+    return res.status(200).json({
+      success: true,
+      valid: true,
+      username: reset.data.username,
+      minPasswordLength: MIN_PASSWORD_LENGTH,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/password/reset/validate:", error.message);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Fija la contraseña nueva con el token del correo.
+app.post("/api/password/reset", async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+
+    const policyError = passwordPolicyError(password);
+    if (policyError) {
+      return res
+        .status(400)
+        .json({ success: false, code: "WEAK_PASSWORD", message: policyError });
+    }
+
+    const reset = await findValidReset(String(token || ""));
+    if (!reset) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "El enlace no es válido o ha caducado. Solicita uno nuevo.",
+      });
+    }
+
+    const { username } = reset.data;
+    const userRef = db.collection("users").doc(username);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists || userDoc.data().active === false) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "El enlace no es válido o ha caducado. Solicita uno nuevo.",
+      });
+    }
+
+    await userRef.set(
+      { passwordHash: await bcrypt.hash(password, 10), passwordChangedAt: Date.now() },
+      { merge: true },
+    );
+    await reset.ref.set({ usedAt: Date.now() }, { merge: true });
+    // Cualquier otro enlace pendiente del mismo usuario deja de servir.
+    await invalidatePending(username);
+
+    logEvent({
+      type: EVENT.PASSWORD_RESET_COMPLETED,
+      req,
+      username,
+      orgname: userDoc.data().orgname || null,
+      orgId: userDoc.data().orgId || null,
+      role: userDoc.data().role || null,
+      success: true,
+      message: "Contraseña restablecida mediante enlace.",
+      detail: { solicitadoPor: reset.data.requestedBy },
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Contraseña actualizada. Ya puedes iniciar sesión.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/password/reset:", error.message);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
   }
 });
 
@@ -3009,6 +3631,10 @@ app.get("/api/integrations", requireAdmin, async (req, res) => {
     snapshot.docs.forEach((doc) => {
       integrations[doc.id] = doc.data();
     });
+    if (integrations.whaibot) {
+      integrations.whaibot.templates = resolveWhatsappTemplates(integrations.whaibot);
+      integrations.whaibot.dailyLimitPerOrg = resolveDailyLimit(integrations.whaibot);
+    }
     return res.status(200).json({ success: true, integrations });
   } catch (error) {
     console.error("❌ Error en GET /api/integrations:", error);
@@ -3021,7 +3647,7 @@ app.get("/api/integrations", requireAdmin, async (req, res) => {
 // Guardar / actualizar la configuración de WhaiBot (botId + apiKey/clientKey).
 app.post("/api/integrations/whaibot", requireAdmin, async (req, res) => {
   try {
-    const { botId, apiKey, enabled } = req.body;
+    const { botId, apiKey, enabled, templates } = req.body;
 
     if (!botId || !apiKey) {
       return res.status(400).json({
@@ -3042,6 +3668,7 @@ app.post("/api/integrations/whaibot", requireAdmin, async (req, res) => {
         },
         { merge: true },
       );
+    invalidateWhaibotCache();
 
     console.log("💾 [Integración WhaiBot] configuración guardada");
     // El apiKey no viaja al log: sanitizeDetail lo descartaría igualmente.
@@ -3052,6 +3679,13 @@ app.post("/api/integrations/whaibot", requireAdmin, async (req, res) => {
       message: "Configuración de la integración WhaiBot actualizada.",
       detail: { botId: String(botId).trim(), habilitado: typeof enabled === "boolean" ? enabled : true },
     });
+
+    // Las plantillas también se pueden guardar desde aquí, aunque tienen su
+    // propia ruta para no exigir reenviar las credenciales.
+    const cleanTemplates = sanitizeWhatsappTemplates(templates);
+    if (cleanTemplates && Object.keys(cleanTemplates).length > 0) {
+      await saveWhatsappTemplates(req, cleanTemplates);
+    }
     return res.status(200).json({
       success: true,
       message: "Configuración de WhaiBot guardada exitosamente.",
@@ -3138,125 +3772,156 @@ app.post("/api/integrations/whaibot/test", requireAdmin, async (req, res) => {
   }
 });
 
-// Estado público de la integración WhaiBot (sin exponer credenciales).
-// Lo usan los clientes para saber si la opción de WhatsApp está disponible.
-app.get("/api/integrations/whaibot/status", async (req, res) => {
+/** Guarda qué plantillas se notifican también por WhatsApp (afecta a todos). */
+async function saveWhatsappTemplates(req, templates) {
+  const cfg = await getWhaibotConfig({ force: true });
+  const next = { ...resolveWhatsappTemplates(cfg), ...templates };
+  await db
+    .collection("integrations")
+    .doc("whaibot")
+    .set({ templates: next, updatedAt: Date.now() }, { merge: true });
+  invalidateWhaibotCache();
+  logEvent({
+    type: EVENT.INTEGRATION_UPDATED,
+    req,
+    target: "whaibot",
+    message: "Plantillas notificadas por WhatsApp actualizadas.",
+    detail: { plantillas: next },
+  });
+  return next;
+}
+
+// Plantillas que se notifican por WhatsApp: { alert, recovered, current, previous }.
+app.post("/api/integrations/whaibot/templates", requireAdmin, async (req, res) => {
   try {
-    const doc = await db.collection("integrations").doc("whaibot").get();
-    const cfg = doc.exists ? doc.data() : null;
-    const configured = !!(cfg && cfg.botId && cfg.apiKey);
-    const enabled = !!(cfg && cfg.enabled !== false && configured);
-    return res.status(200).json({ success: true, enabled, configured });
+    const clean = sanitizeWhatsappTemplates(req.body?.templates);
+    if (!clean || Object.keys(clean).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: `templates debe ser un objeto con valores boolean para: ${WHATSAPP_TEMPLATES.join(", ")}.`,
+      });
+    }
+    const templates = await saveWhatsappTemplates(req, clean);
+    return res.status(200).json({
+      success: true,
+      templates,
+      message: "Plantillas de WhatsApp actualizadas.",
+    });
   } catch (error) {
-    console.error("❌ Error en GET /api/integrations/whaibot/status:", error);
+    console.error("❌ Error en POST /api/integrations/whaibot/templates:", error);
     return res
       .status(500)
-      .json({ success: false, enabled: false, configured: false });
+      .json({ success: false, message: "Error interno del servidor", detail: error.message });
   }
 });
 
-// Enviar un mensaje de prueba de WhatsApp (vía WhaiBot) a los números del cliente.
-// Acepta { to: "<numero>" } o { numbers: ["<numero>", ...] }.
-//
-// Restringido a supervisores y administradores: la notificación por WhatsApp no
-// se libera todavía a los clientes. Además, sin guard de rol este endpoint era
-// un primitivo de "enviar un WhatsApp a un número arbitrario" disponible para
-// cualquier usuario con sesión.
-app.post(
-  "/api/integrations/whaibot/send-test",
-  requireRole("administrator", "supervisor"),
-  async (req, res) => {
+// Tope de WhatsApp por organización y día: { dailyLimitPerOrg }.
+app.post("/api/integrations/whaibot/daily-limit", requireAdmin, async (req, res) => {
   try {
-    const { to, numbers } = req.body;
-
-    // Normalizar destinos: solo dígitos, formato internacional sin '+'
-    let targets = [];
-    if (Array.isArray(numbers)) targets = numbers;
-    else if (to) targets = [to];
-    targets = targets
-      .map((n) => String(n).replace(/\D/g, ""))
-      .filter((n) => n.length >= 8);
-
-    if (targets.length === 0) {
+    const value = Number(req.body?.dailyLimitPerOrg);
+    if (!Number.isInteger(value) || value < 1 || value > 10000) {
       return res.status(400).json({
         success: false,
-        message: "Debes indicar al menos un número válido.",
+        message: "dailyLimitPerOrg debe ser un entero entre 1 y 10000.",
       });
     }
+    await db
+      .collection("integrations")
+      .doc("whaibot")
+      .set({ dailyLimitPerOrg: value, updatedAt: Date.now() }, { merge: true });
+    invalidateWhaibotCache();
+    logEvent({
+      type: EVENT.INTEGRATION_UPDATED,
+      req,
+      target: "whaibot",
+      message: `Límite diario de WhatsApp por organización: ${value}.`,
+      detail: { dailyLimitPerOrg: value },
+    });
+    return res.status(200).json({ success: true, dailyLimitPerOrg: value, message: "Límite diario actualizado." });
+  } catch (error) {
+    console.error("❌ Error en POST /api/integrations/whaibot/daily-limit:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
 
-    const doc = await db.collection("integrations").doc("whaibot").get();
-    if (!doc.exists) {
-      return res.status(400).json({
-        success: false,
-        message: "La integración de WhatsApp (WhaiBot) no está configurada.",
-      });
-    }
-    const cfg = doc.data();
-    if (cfg.enabled === false) {
+/**
+ * ¿Puede la sesión actual usar WhatsApp? Hace falta la integración global y que
+ * la organización de la sesión (la del JWT) lo tenga habilitado.
+ */
+async function whatsappStatusForSession(req) {
+  const cfg = await getWhaibotConfig();
+  const configured = isWhaibotConfigured(cfg);
+  const enabled = isWhaibotEnabled(cfg);
+  const orgDoc = await findOrgDoc(req.auth?.orgId);
+  const orgEnabled = orgDoc ? isOrgWhatsappEnabled(orgDoc.data()) : false;
+  return {
+    enabled,
+    configured,
+    orgEnabled,
+    // Lo único que debe mirar el dashboard para mostrar u ocultar la opción.
+    available: enabled && orgEnabled,
+    templates: resolveWhatsappTemplates(cfg),
+  };
+}
+
+// Estado de WhatsApp para la sesión (sin exponer credenciales). Lo usan los
+// usuarios para saber si deben ver la opción de notificaciones por WhatsApp.
+app.get("/api/integrations/whaibot/status", async (req, res) => {
+  try {
+    const status = await whatsappStatusForSession(req);
+    const userDoc = await sessionUserDoc(req);
+    const prefs = userDoc ? userDoc.data().preferences || {} : {};
+    return res.status(200).json({
+      success: true,
+      ...status,
+      // Número del propio usuario, ya verificado (o null).
+      verifiedNumber: prefs.whatsappVerifiedAt ? (prefs.whatsappRecipients || [])[0] || null : null,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/integrations/whaibot/status:", error);
+    return res.status(500).json({
+      success: false,
+      enabled: false,
+      configured: false,
+      orgEnabled: false,
+      available: false,
+    });
+  }
+});
+
+// Enviar un mensaje de prueba de WhatsApp al número verificado del usuario.
+// No acepta números en el cuerpo: así no es un primitivo de "enviar WhatsApp a
+// números arbitrarios".
+app.post("/api/integrations/whaibot/send-test", async (req, res) => {
+  try {
+    const status = await whatsappStatusForSession(req);
+    if (!status.available) {
       return res.status(403).json({
         success: false,
-        message: "La integración de WhatsApp (WhaiBot) está deshabilitada.",
+        code: "WHATSAPP_DISABLED",
+        message: "Las notificaciones por WhatsApp no están habilitadas para tu organización.",
       });
     }
-    if (!cfg.botId || !cfg.apiKey) {
+    const userDoc = await sessionUserDoc(req);
+    const prefs = userDoc ? userDoc.data().preferences || {} : {};
+    const [number] = prefs.whatsappVerifiedAt ? normalizeNumbers(prefs.whatsappRecipients || []) : [];
+    if (!number) {
       return res.status(400).json({
         success: false,
-        message:
-          "La integración de WhatsApp (WhaiBot) no está configurada correctamente.",
+        code: "NOT_VERIFIED",
+        message: "Primero verifica tu número de WhatsApp.",
       });
     }
 
-    const baseUrl = process.env.WHAIBOT_API_URL || "https://whaibot.com";
-    const mensaje =
-      "✅ ¡Tu número ha sido configurado correctamente para recibir notificaciones de License Manager!\n\n" +
-      "Para asegurar la correcta entrega de los mensajes, por favor:\n" +
-      "1️⃣ Guarda este número en tus contactos.\n" +
-      "2️⃣ Responde a este mensaje indicando que estás de acuerdo con recibir notificaciones por WhatsApp.\n\n" +
-      "¡Gracias! 🙌";
-
-    const results = [];
-    for (const target of targets) {
-      try {
-        const r = await fetch(`${baseUrl}/api/send-message`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-client-key": String(cfg.apiKey).trim(),
-            "x-client-botid": String(cfg.botId).trim(),
-          },
-          body: JSON.stringify({
-            to: target,
-            message: mensaje,
-            fromMe: "License Manager",
-          }),
-        });
-        const data = await r.json().catch(() => ({}));
-        results.push({
-          to: target,
-          success: !!(r.ok && data.success),
-          message: data.message || data.error || `HTTP ${r.status}`,
-        });
-      } catch (err) {
-        results.push({
-          to: target,
-          success: false,
-          message: "Error de red: " + err.message,
-        });
-      }
-    }
-
-    const allOk = results.every((x) => x.success);
-    const anyOk = results.some((x) => x.success);
+    const cfg = await getWhaibotConfig();
+    const result = await sendWhaibotMessage(cfg, number, whatsappText(prefs.language, "test"));
     return res.status(200).json({
-      success: anyOk,
-      allSent: allOk,
-      results,
-      message: allOk
-        ? "Mensaje de prueba enviado correctamente."
-        : anyOk
-          ? "Algunos mensajes no se pudieron enviar."
-          : (results[0] && results[0].message) ||
-          "No se pudo enviar el mensaje de prueba.",
+      success: result.success,
+      allSent: result.success,
+      results: [result],
+      message: result.success ? "Mensaje de prueba enviado correctamente." : result.message,
     });
   } catch (error) {
     console.error("❌ Error en POST /api/integrations/whaibot/send-test:", error);
@@ -3265,9 +3930,275 @@ app.post(
       message: "Error interno al enviar el mensaje de prueba.",
       detail: error.message,
     });
+  }
+});
+
+// ==================== Verificación del número de WhatsApp ====================
+// Cada usuario registra UN número y sólo queda activo tras confirmar un código
+// de 6 dígitos enviado por WhatsApp. El número y `whatsappVerifiedAt` los
+// gestiona sólo el servidor: /api/setuser los ignora (ver
+// withServerManagedWhatsapp), así que no se puede registrar un número ajeno.
+//
+//   whatsappVerifications/{username} → { number, codeHash, expiresAt, attempts, sends, windowStart, sentAt }
+
+const WA_CODE_TTL_MINUTES = 10;
+const WA_CODE_MAX_ATTEMPTS = 5;
+const WA_CODE_RESEND_SECONDS = 60;
+const WA_CODE_MAX_SENDS_PER_HOUR = 5;
+
+function hashWhatsappCode(username, code) {
+  return crypto
+    .createHash("sha256")
+    .update(`${username}:${code}:${process.env.JWT_SECRET || ""}`)
+    .digest("hex");
+}
+
+async function sessionUserDoc(req) {
+  const username = req.auth?.sub;
+  if (!username) return null;
+  const doc = await db.collection("users").doc(String(username)).get();
+  return doc.exists ? doc : null;
+}
+
+// Paso 1: enviar el código al número indicado.
+app.post("/api/whatsapp/verification/start", async (req, res) => {
+  try {
+    const status = await whatsappStatusForSession(req);
+    if (!status.available) {
+      return res.status(403).json({
+        success: false,
+        code: "WHATSAPP_DISABLED",
+        message: "Las notificaciones por WhatsApp no están habilitadas para tu organización.",
+      });
     }
-  },
-);
+
+    const [number] = normalizeNumbers(req.body?.number);
+    if (!number || number.length > 15) {
+      return res.status(400).json({ success: false, code: "INVALID_NUMBER", message: "Número de WhatsApp no válido." });
+    }
+
+    const userDoc = await sessionUserDoc(req);
+    if (!userDoc) {
+      return res.status(404).json({ success: false, message: "Usuario no encontrado." });
+    }
+    const username = userDoc.id;
+    const ref = db.collection("whatsappVerifications").doc(username);
+    const previous = (await ref.get()).data() || {};
+    const now = Date.now();
+
+    if (previous.sentAt && now - previous.sentAt < WA_CODE_RESEND_SECONDS * 1000) {
+      return res.status(429).json({
+        success: false,
+        code: "RESEND_TOO_SOON",
+        retryAfter: Math.ceil((WA_CODE_RESEND_SECONDS * 1000 - (now - previous.sentAt)) / 1000),
+        message: "Espera un momento antes de pedir otro código.",
+      });
+    }
+    const inWindow = previous.windowStart && now - previous.windowStart < 60 * 60 * 1000;
+    const sends = inWindow ? previous.sends || 0 : 0;
+    if (sends >= WA_CODE_MAX_SENDS_PER_HOUR) {
+      return res.status(429).json({
+        success: false,
+        code: "TOO_MANY_CODES",
+        message: "Demasiados códigos solicitados. Inténtalo de nuevo en una hora.",
+      });
+    }
+
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    const lang = userDoc.data().preferences?.language;
+    const cfg = await getWhaibotConfig();
+    const result = await sendWhaibotMessage(
+      cfg,
+      number,
+      whatsappText(lang, "verification", { code, minutes: WA_CODE_TTL_MINUTES }),
+    );
+    if (!result.success) {
+      return res.status(502).json({
+        success: false,
+        code: "SEND_FAILED",
+        message: `No se pudo enviar el código por WhatsApp: ${result.message}`,
+      });
+    }
+
+    await ref.set({
+      number,
+      codeHash: hashWhatsappCode(username, code),
+      expiresAt: now + WA_CODE_TTL_MINUTES * 60 * 1000,
+      attempts: 0,
+      sentAt: now,
+      sends: sends + 1,
+      windowStart: inWindow ? previous.windowStart : now,
+    });
+
+    return res.status(200).json({
+      success: true,
+      expiresInMinutes: WA_CODE_TTL_MINUTES,
+      message: "Código enviado por WhatsApp.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/whatsapp/verification/start:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// Paso 2: confirmar el código. Si es correcto, el número queda registrado.
+app.post("/api/whatsapp/verification/confirm", async (req, res) => {
+  try {
+    const code = String(req.body?.code || "").replace(/\D/g, "");
+    if (code.length !== 6) {
+      return res.status(400).json({ success: false, code: "INVALID_CODE", message: "El código debe tener 6 dígitos." });
+    }
+
+    const userDoc = await sessionUserDoc(req);
+    if (!userDoc) {
+      return res.status(404).json({ success: false, message: "Usuario no encontrado." });
+    }
+    const username = userDoc.id;
+    const ref = db.collection("whatsappVerifications").doc(username);
+    const snap = await ref.get();
+    const pending = snap.exists ? snap.data() : null;
+
+    if (!pending || !pending.codeHash) {
+      return res.status(400).json({ success: false, code: "NO_PENDING", message: "No hay un código pendiente. Solicita uno nuevo." });
+    }
+    if (Date.now() > pending.expiresAt) {
+      return res.status(400).json({ success: false, code: "CODE_EXPIRED", message: "El código venció. Solicita uno nuevo." });
+    }
+    if ((pending.attempts || 0) >= WA_CODE_MAX_ATTEMPTS) {
+      return res.status(429).json({ success: false, code: "TOO_MANY_ATTEMPTS", message: "Demasiados intentos. Solicita un código nuevo." });
+    }
+
+    const expected = Buffer.from(pending.codeHash, "hex");
+    const received = Buffer.from(hashWhatsappCode(username, code), "hex");
+    if (!crypto.timingSafeEqual(expected, received)) {
+      await ref.set({ attempts: (pending.attempts || 0) + 1 }, { merge: true });
+      return res.status(400).json({
+        success: false,
+        code: "WRONG_CODE",
+        attemptsLeft: WA_CODE_MAX_ATTEMPTS - (pending.attempts || 0) - 1,
+        message: "Código incorrecto.",
+      });
+    }
+
+    const verifiedAt = Date.now();
+    await userDoc.ref.set(
+      {
+        preferences: {
+          whatsappRecipients: [pending.number],
+          whatsappVerifiedAt: verifiedAt,
+          whatsappNotifications: true,
+        },
+      },
+      { merge: true },
+    );
+    // Se conserva el ritmo de envíos para que borrar y volver a verificar no
+    // permita saltarse el límite de códigos por hora.
+    await ref.set(
+      { codeHash: null, expiresAt: 0, attempts: 0 },
+      { merge: true },
+    );
+
+    logEvent({
+      type: EVENT.USER_UPDATED,
+      req,
+      target: username,
+      message: "Número de WhatsApp verificado.",
+      detail: { campos: "whatsappRecipients" },
+    });
+
+    // Mensaje de bienvenida: pide guardar el contacto y responder, lo que
+    // mejora la entrega de los siguientes mensajes del bot.
+    const cfg = await getWhaibotConfig();
+    sendWhaibotMessage(cfg, pending.number, whatsappText(userDoc.data().preferences?.language, "verified")).catch(
+      () => {},
+    );
+
+    return res.status(200).json({
+      success: true,
+      number: pending.number,
+      verifiedAt,
+      message: "Número de WhatsApp verificado.",
+    });
+  } catch (error) {
+    console.error("❌ Error en POST /api/whatsapp/verification/confirm:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// Quitar el número registrado (para cambiarlo hay que verificar otro).
+app.post("/api/whatsapp/number/remove", async (req, res) => {
+  try {
+    const userDoc = await sessionUserDoc(req);
+    if (!userDoc) {
+      return res.status(404).json({ success: false, message: "Usuario no encontrado." });
+    }
+    await userDoc.ref.set(
+      {
+        preferences: {
+          whatsappRecipients: [],
+          whatsappVerifiedAt: null,
+          whatsappNotifications: false,
+        },
+      },
+      { merge: true },
+    );
+    return res.status(200).json({ success: true, message: "Número de WhatsApp eliminado." });
+  } catch (error) {
+    console.error("❌ Error en POST /api/whatsapp/number/remove:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// ==================== Alertas de la plataforma ====================
+// Contacto que recibe los errores de License Manager (correo y, si falla,
+// WhatsApp). Ver utils/platformAlerts.js.
+
+app.get("/api/settings/platform-alerts", requireAdmin, async (req, res) => {
+  try {
+    const settings = await getPlatformAlertSettings({ force: true });
+    return res.status(200).json({ success: true, settings });
+  } catch (error) {
+    console.error("❌ Error en GET /api/settings/platform-alerts:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+app.post("/api/settings/platform-alerts", requireAdmin, async (req, res) => {
+  try {
+    const { enabled, email, whatsapp } = req.body || {};
+    const settings = await savePlatformAlertSettings({ enabled, email, whatsapp });
+    logEvent({
+      type: EVENT.INTEGRATION_UPDATED,
+      req,
+      target: "platformAlerts",
+      message: "Contacto de alertas de la plataforma actualizado.",
+      detail: { habilitado: settings.enabled, correo: settings.email, whatsapp: settings.whatsapp },
+    });
+    return res.status(200).json({ success: true, settings, message: "Alertas de la plataforma guardadas." });
+  } catch (error) {
+    console.error("❌ Error en POST /api/settings/platform-alerts:", error);
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+// Envío de prueba por un canal concreto: { channel: "email" | "whatsapp" }.
+app.post("/api/settings/platform-alerts/test", requireAdmin, async (req, res) => {
+  const channel = req.body?.channel === "whatsapp" ? "whatsapp" : "email";
+  try {
+    await deliverAlert(
+      {
+        source: "prueba",
+        title: "Prueba de alertas de la plataforma",
+        message: `Mensaje de prueba solicitado por ${req.auth?.sub || "el administrador"}. Si lo recibes, las alertas de License Manager llegan a este contacto.`,
+        at: Date.now(),
+      },
+      { force: true, channel },
+    );
+    return res.status(200).json({ success: true, channel, message: "Alerta de prueba enviada." });
+  } catch (error) {
+    return res.status(200).json({ success: false, channel, message: error.message });
+  }
+});
 
 // Endpoint para enviar correos por SMTP
 app.post("/api/sendmail", async (req, res) => {
@@ -3717,4 +4648,42 @@ app.post("/api/firestore-test", requireAdmin, async (req, res) => {
       error: "Error al comunicarse con Firestore",
     });
   }
+});
+
+// ==================== Errores no controlados ====================
+// Último manejador: errores lanzados por una ruta (o por express.json con un
+// cuerpo inválido) que nadie capturó. Responde JSON sin la traza; el aviso al
+// contacto de alertas lo emite serverErrorMonitor al ver el 500.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = Number(err.status || err.statusCode) || 500;
+  if (status >= 500) console.error(`❌ Error no controlado en ${req.method} ${req.path}:`, err);
+  return res.status(status).json({
+    success: false,
+    message: status >= 500 ? "Error interno del servidor" : err.message,
+    detail: status >= 500 ? err.message : undefined,
+  });
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Promesa rechazada sin manejar:", reason);
+  notifyPlatformError({
+    source: "proceso",
+    title: "Promesa rechazada sin manejar",
+    message: reason instanceof Error ? reason.message : String(reason),
+    detail: reason instanceof Error ? reason.stack : undefined,
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("❌ Excepción no capturada:", error);
+  notifyPlatformError({
+    source: "proceso",
+    title: "Excepción no capturada: la API se reinicia",
+    message: error.message,
+    detail: error.stack,
+  });
+  // El proceso queda en un estado indefinido: se sale (el orquestador de
+  // contenedores lo reinicia) tras dar unos segundos al aviso.
+  setTimeout(() => process.exit(1), 5000).unref();
 });

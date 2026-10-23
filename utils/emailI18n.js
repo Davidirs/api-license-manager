@@ -177,6 +177,19 @@ const MESSAGES = {
     "userupdated.footer_note": "Este correo es una notificación de seguridad. Por favor, no lo respondas.",
     "userupdated.text": "✅ Actualización de Perfil en {{org}} ✅\n\nTu información de usuario en {{org}} ha sido actualizada exitosamente.\n\n================================\n👤 DETALLES DE LA CUENTA\n================================\n\nORGANIZACIÓN: {{org}}\nUSUARIO: {{user}}\n{{passwordNote}}\n--------------------------------\n\nSi no realizaste esta acción o si tienes preguntas, contacta a soporte en: {{support}}\n\nEste es un mensaje automático.",
     "userupdated.text_password_note": "⚠️ NOTA: Tu contraseña fue cambiada.\n",
+
+    "passwordreset.subject": "🔑 Restablece tu contraseña de License Manager",
+    "passwordreset.title": "🔑 Restablecer contraseña",
+    "passwordreset.subtitle": "Recibimos una solicitud para cambiar tu contraseña.",
+    "passwordreset.intro_self": "Alguien (probablemente tú) solicitó restablecer la contraseña de la cuenta <b>{{user}}</b>.",
+    "passwordreset.intro_admin": "El administrador de la plataforma solicitó que restablezcas la contraseña de la cuenta <b>{{user}}</b>.",
+    "passwordreset.cta": "Crear nueva contraseña",
+    "passwordreset.expires": "El enlace es válido durante {{minutes}} minutos y sólo puede usarse una vez.",
+    "passwordreset.link_fallback": "Si el botón no funciona, copia y pega este enlace en tu navegador:",
+    "passwordreset.ignore": "Si no solicitaste este cambio, ignora este correo: tu contraseña actual seguirá funcionando.",
+    "passwordreset.text": "🔑 Restablecer contraseña - License Manager\n\n{{intro}}\n\nCrea tu nueva contraseña en este enlace (válido durante {{minutes}} minutos, un solo uso):\n{{link}}\n\nSi no solicitaste este cambio, ignora este correo.\n\nSoporte: {{support}}",
+    "passwordreset.text_intro_self": "Se solicitó restablecer la contraseña de la cuenta {{user}}.",
+    "passwordreset.text_intro_admin": "El administrador solicitó que restablezcas la contraseña de la cuenta {{user}}.",
   },
 
   en: {
@@ -290,6 +303,19 @@ const MESSAGES = {
     "userupdated.footer_note": "This email is a security notification. Please do not reply to it.",
     "userupdated.text": "✅ Profile Update in {{org}} ✅\n\nYour user information in {{org}} has been updated successfully.\n\n================================\n👤 ACCOUNT DETAILS\n================================\n\nORGANIZATION: {{org}}\nUSERNAME: {{user}}\n{{passwordNote}}\n--------------------------------\n\nIf you did not perform this action, or if you have questions, contact support at: {{support}}\n\nThis is an automated message.",
     "userupdated.text_password_note": "⚠️ NOTE: Your password was changed.\n",
+
+    "passwordreset.subject": "🔑 Reset your License Manager password",
+    "passwordreset.title": "🔑 Reset password",
+    "passwordreset.subtitle": "We received a request to change your password.",
+    "passwordreset.intro_self": "Someone (probably you) requested a password reset for the account <b>{{user}}</b>.",
+    "passwordreset.intro_admin": "The platform administrator requested that you reset the password for the account <b>{{user}}</b>.",
+    "passwordreset.cta": "Create new password",
+    "passwordreset.expires": "The link is valid for {{minutes}} minutes and can only be used once.",
+    "passwordreset.link_fallback": "If the button doesn't work, copy and paste this link into your browser:",
+    "passwordreset.ignore": "If you didn't request this change, ignore this email: your current password will keep working.",
+    "passwordreset.text": "🔑 Reset password - License Manager\n\n{{intro}}\n\nCreate your new password at this link (valid for {{minutes}} minutes, single use):\n{{link}}\n\nIf you didn't request this change, ignore this email.\n\nSupport: {{support}}",
+    "passwordreset.text_intro_self": "A password reset was requested for the account {{user}}.",
+    "passwordreset.text_intro_admin": "The administrator requested that you reset the password for the account {{user}}.",
   },
 
   pt: {
@@ -403,6 +429,19 @@ const MESSAGES = {
     "userupdated.footer_note": "Este e-mail é uma notificação de segurança. Por favor, não responda.",
     "userupdated.text": "✅ Atualização de Perfil em {{org}} ✅\n\nSuas informações de usuário em {{org}} foram atualizadas com sucesso.\n\n================================\n👤 DETALHES DA CONTA\n================================\n\nORGANIZAÇÃO: {{org}}\nUSUÁRIO: {{user}}\n{{passwordNote}}\n--------------------------------\n\nSe você não realizou esta ação, ou se tiver dúvidas, fale com o suporte em: {{support}}\n\nEsta é uma mensagem automática.",
     "userupdated.text_password_note": "⚠️ OBSERVAÇÃO: Sua senha foi alterada.\n",
+
+    "passwordreset.subject": "🔑 Redefina sua senha do License Manager",
+    "passwordreset.title": "🔑 Redefinir senha",
+    "passwordreset.subtitle": "Recebemos uma solicitação para alterar sua senha.",
+    "passwordreset.intro_self": "Alguém (provavelmente você) solicitou a redefinição da senha da conta <b>{{user}}</b>.",
+    "passwordreset.intro_admin": "O administrador da plataforma solicitou que você redefina a senha da conta <b>{{user}}</b>.",
+    "passwordreset.cta": "Criar nova senha",
+    "passwordreset.expires": "O link é válido por {{minutes}} minutos e só pode ser usado uma vez.",
+    "passwordreset.link_fallback": "Se o botão não funcionar, copie e cole este link no seu navegador:",
+    "passwordreset.ignore": "Se você não solicitou esta alteração, ignore este e-mail: sua senha atual continuará funcionando.",
+    "passwordreset.text": "🔑 Redefinir senha - License Manager\n\n{{intro}}\n\nCrie sua nova senha neste link (válido por {{minutes}} minutos, uso único):\n{{link}}\n\nSe você não solicitou esta alteração, ignore este e-mail.\n\nSuporte: {{support}}",
+    "passwordreset.text_intro_self": "Foi solicitada a redefinição da senha da conta {{user}}.",
+    "passwordreset.text_intro_admin": "O administrador solicitou que você redefina a senha da conta {{user}}.",
   },
 };
 

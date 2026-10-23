@@ -263,7 +263,7 @@ function periodBanner(title, start, end, extraNote) {
     </div>`;
 }
 
-function shell({ headerColor, title, subtitle, body, orgName, footerColor, settings, t }) {
+function shell({ headerColor, title, subtitle, body, orgName, footerColor, footerNote, settings, t }) {
   return `<!DOCTYPE html>
 <html lang="${t.language}">
   <head>
@@ -281,7 +281,7 @@ function shell({ headerColor, title, subtitle, body, orgName, footerColor, setti
         ${body}
       </div>
       <div style="background: ${footerColor || "#1e293b"}; color: white; padding: 24px; text-align: center;">
-        <p style="margin: 0 0 16px 0; font-size: 14px; opacity: 0.8;">${t("footer.generated_for", { org: orgName })}</p>
+        <p style="margin: 0 0 16px 0; font-size: 14px; opacity: 0.8;">${footerNote || t("footer.generated_for", { org: orgName })}</p>
         ${footerHtml(settings, t)}
       </div>
     </div>
@@ -668,6 +668,48 @@ function generateTemplate(templateType, data) {
           org: data.orgname,
           user: data.usuario,
           passwordNote: isPasswordUpdate ? t("userupdated.text_password_note") : "",
+          support,
+        }),
+      };
+    }
+
+    // Enlace para restablecer la contraseña. Lo pide el propio usuario desde
+    // el login o el administrador desde /settings (`byAdmin`).
+    case "passwordreset": {
+      const minutes = data.expiresInMinutes || 60;
+      const intro = data.byAdmin
+        ? t("passwordreset.intro_admin", { user: data.usuario })
+        : t("passwordreset.intro_self", { user: data.usuario });
+      const textIntro = data.byAdmin
+        ? t("passwordreset.text_intro_admin", { user: data.usuario })
+        : t("passwordreset.text_intro_self", { user: data.usuario });
+
+      return {
+        subject: t("passwordreset.subject"),
+        html: shell({
+          headerColor: "#4f46e5",
+          title: t("passwordreset.title"),
+          subtitle: t("passwordreset.subtitle"),
+          orgName: data.orgname || "License Manager",
+          footerNote: t("userupdated.footer_note"),
+          settings,
+          t,
+          body: `
+            <p style="margin: 0 0 20px 0; color: #1e293b; font-size: 15px; line-height: 1.5;">${intro}</p>
+            <div style="text-align: center; margin: 28px 0;">
+              <a href="${data.resetUrl}" style="display: inline-block; background: #4f46e5; color: white; padding: 14px 28px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 16px;">
+                ${t("passwordreset.cta")}
+              </a>
+            </div>
+            <p style="margin: 0 0 16px 0; color: #b45309; font-size: 13px; text-align: center;">${t("passwordreset.expires", { minutes })}</p>
+            <p style="margin: 0 0 6px 0; color: #64748b; font-size: 12px;">${t("passwordreset.link_fallback")}</p>
+            <p style="margin: 0 0 20px 0; color: #4f46e5; font-size: 12px; word-break: break-all;">${data.resetUrl}</p>
+            <p style="margin: 0; color: #64748b; font-size: 12px;">${t("passwordreset.ignore")}</p>`,
+        }),
+        text: t("passwordreset.text", {
+          intro: textIntro,
+          minutes,
+          link: data.resetUrl,
           support,
         }),
       };

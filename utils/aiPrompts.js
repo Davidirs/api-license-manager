@@ -9,18 +9,28 @@ const { normalizeLanguage, languageName } = require("./emailI18n");
 
 const PROMPTS = {
   es: {
-    metricsIntro: "Analiza las siguientes métricas de Genesys Cloud y proporciona:",
+    sectionSummary: "Resumen ejecutivo de uso",
+    sectionKpis: "Estado de KPIs principales",
+    sectionAlerts: "Alertas",
+    kpiLicenses: "Licencias",
+    kpiResources: "Recursos",
+    kpiStorage: "Storage",
+    kpiAiTokens: "IA tokens",
+    kpiOutbound: "Outbound attempts",
+    metricsIntro:
+      "Analiza las siguientes métricas de Genesys Cloud y proporciona un análisis sumamente conciso y directo estructurado exactamente en estas 3 secciones:",
     metricsSections: [
       "Resumen ejecutivo de uso",
-      "Estado de KPIs principales (licencias, recursos, storage, IA tokens e intentos Outbound)",
-      "Alertas (si hay sobreuso)",
-      "Recomendaciones específicas para optimización",
+      "Estado de KPIs principales",
+      "Alertas",
     ],
     metricsLicenses: "Datos de licencias y uso general:",
     metricsLogins: "Resumen de conexiones diarias:",
     metricsOutbound: "Resumen de intentos outbound y campañas:",
     metricsOverage: "Detalles de sobreuso y últimos inicios de sesión:",
     metricsNoOverage: "No hay sobreuso de licencias detectado.",
+    metricsFairUse:
+      "Fair use calculado por el servidor (BYOC Cloud e intentos outbound se miden contra este límite, no contra lo prepagado):",
 
     comparisonIntro:
       "Analiza la siguiente comparativa de métricas de Genesys Cloud entre periodos de facturación:",
@@ -38,18 +48,28 @@ const PROMPTS = {
   },
 
   en: {
-    metricsIntro: "Analyze the following Genesys Cloud metrics and provide:",
+    sectionSummary: "Executive summary of usage",
+    sectionKpis: "Status of main KPIs",
+    sectionAlerts: "Alerts",
+    kpiLicenses: "Licenses",
+    kpiResources: "Resources",
+    kpiStorage: "Storage",
+    kpiAiTokens: "AI tokens",
+    kpiOutbound: "Outbound attempts",
+    metricsIntro:
+      "Analyze the following Genesys Cloud metrics and provide a very concise and direct analysis structured exactly into these 3 sections:",
     metricsSections: [
       "Executive summary of usage",
-      "Status of the main KPIs (licenses, resources, storage, AI tokens and Outbound attempts)",
-      "Alerts (if there is any overage)",
-      "Specific recommendations for optimization",
+      "Status of main KPIs",
+      "Alerts",
     ],
     metricsLicenses: "License data and general usage:",
     metricsLogins: "Daily logins summary:",
     metricsOutbound: "Outbound attempts and campaigns summary:",
     metricsOverage: "Overage details and most recent logins:",
     metricsNoOverage: "No license overage detected.",
+    metricsFairUse:
+      "Fair use calculated by the server (BYOC Cloud and outbound attempts are measured against this limit, not against the prepaid amount):",
 
     comparisonIntro:
       "Analyze the following comparison of Genesys Cloud metrics across billing periods:",
@@ -67,18 +87,28 @@ const PROMPTS = {
   },
 
   pt: {
-    metricsIntro: "Analise as seguintes métricas do Genesys Cloud e forneça:",
+    sectionSummary: "Resumo executivo de uso",
+    sectionKpis: "Situação dos principais KPIs",
+    sectionAlerts: "Alertas",
+    kpiLicenses: "Licenças",
+    kpiResources: "Recursos",
+    kpiStorage: "Storage",
+    kpiAiTokens: "Tokens de IA",
+    kpiOutbound: "Tentativas de Outbound",
+    metricsIntro:
+      "Analise as seguintes métricas do Genesys Cloud e forneça uma análise altamente concisa e direta estruturada exatamente nestas 3 seções:",
     metricsSections: [
       "Resumo executivo de uso",
-      "Situação dos principais KPIs (licenças, recursos, armazenamento, tokens de IA e tentativas de Outbound)",
-      "Alertas (caso haja excedente)",
-      "Recomendações específicas de otimização",
+      "Situação dos principais KPIs",
+      "Alertas",
     ],
-    metricsLicenses: "Dados de licenças e uso geral:",
-    metricsLogins: "Resumo de acessos diários:",
-    metricsOutbound: "Resumo de tentativas de outbound e campanhas:",
-    metricsOverage: "Detalhes de excedente e últimos acessos:",
-    metricsNoOverage: "Nenhum excedente de licenças detectado.",
+    metricsLicenses: "Dados de licenças e uso general:",
+    metricsLogins: "Resumo de conexões diárias:",
+    metricsOutbound: "Resumo de tentativas outbound e campanhas:",
+    metricsOverage: "Detalhes de sobreuso e últimos inícios de sessão:",
+    metricsNoOverage: "Nenhum sobreuso de licenças detectado.",
+    metricsFairUse:
+      "Fair use calculado pelo servidor (BYOC Cloud e tentativas outbound são medidos contra este limite, não contra o pré-pago):",
 
     comparisonIntro:
       "Analise a seguinte comparação de métricas do Genesys Cloud entre períodos de faturamento:",

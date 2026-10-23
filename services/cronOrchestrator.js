@@ -14,6 +14,8 @@ const { db } = require("../firebase");
 const { enqueueOrgMonitor } = require("./monitorQueue");
 const { isKnownRegion } = require("../utils/genesysRegions");
 const { purgeOldLogs } = require("../utils/auditLog");
+const { isOrgWhatsappEnabled, normalizeNumbers } = require("../utils/whaibot");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 const PAGE_SIZE = Number(process.env.MONITOR_FIRESTORE_PAGE_SIZE) || 500;
 const CRON_EXPRESSION = process.env.MONITOR_CRON || "0 * * * *";
@@ -28,6 +30,22 @@ function isActive(entity) {
   return entity?.active !== false;
 }
 
+/** Correos del usuario, sólo si tiene activadas las notificaciones por correo. */
+function emailRecipientsOf(user) {
+  return user.preferences?.emailNotifications ? user.preferences?.recipients || [] : [];
+}
+
+/**
+ * Número de WhatsApp del usuario, sólo si él mismo lo activó y lo verificó con
+ * el código (`whatsappVerifiedAt`). Si su organización tiene WhatsApp
+ * habilitado se decide en el worker, por org.
+ */
+function whatsappRecipientsOf(user) {
+  const prefs = user.preferences || {};
+  if (!prefs.whatsappNotifications || !prefs.whatsappVerifiedAt) return [];
+  return normalizeNumbers(prefs.whatsappRecipients || []).slice(0, 1);
+}
+
 /** Sólo se conservan los campos que el worker necesita: los jobs viajan por Redis. */
 function compactUser(user) {
   return {
@@ -35,7 +53,11 @@ function compactUser(user) {
     role: user.role,
     orgname: user.orgname,
     preferences: {
-      recipients: user.preferences?.recipients || [],
+      // Vacío si el usuario desactivó el correo: puede quedar sólo con WhatsApp.
+      recipients: emailRecipientsOf(user),
+      whatsappRecipients: whatsappRecipientsOf(user),
+      whatsappTemplates: user.preferences?.whatsappTemplates || {},
+      whatsappQuietHours: user.preferences?.whatsappQuietHours || null,
       alertThreshold: user.preferences?.alertThreshold,
       notificationDays: user.preferences?.notificationDays || [],
       notificationTime: user.preferences?.notificationTime || "08:00",
@@ -106,6 +128,7 @@ async function loadActiveOrganizations() {
       region: org.region,
       clientId: org.clientId,
       clientSecret: org.clientSecret,
+      whatsappEnabled: isOrgWhatsappEnabled(org),
     };
 
     byId[org.orgId] = entry;
@@ -158,12 +181,15 @@ async function buildOrgJobs(orgs) {
       continue;
     }
 
-    if (!user.preferences?.emailNotifications) {
+    const wantsEmail = Boolean(user.preferences?.emailNotifications);
+    const wantsWhatsapp = Boolean(user.preferences?.whatsappNotifications);
+
+    if (!wantsEmail && !wantsWhatsapp) {
       stats.sinNotificaciones += 1;
       continue;
     }
 
-    if ((user.preferences?.recipients || []).length === 0) {
+    if (emailRecipientsOf(user).length === 0 && whatsappRecipientsOf(user).length === 0) {
       stats.sinDestinatarios += 1;
       continue;
     }
@@ -196,24 +222,31 @@ function currentHourKey() {
   return new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
 }
 
+function currentTimestamp() {
+  return new Date().toISOString();
+}
+
 async function runDailyMonitor() {
   const started = Date.now();
-  console.log("🕒 [Cron] Iniciando monitor de correos...");
+  const startTime = currentTimestamp();
+  console.log(`\n=============================================================`);
+  console.log(`🕒 [Cron] [${startTime}] Iniciando monitor de correos...`);
+  console.log(`=============================================================`);
 
   try {
     const orgs = await loadActiveOrganizations();
     console.log(
-      `[Cron] Organizaciones activas: ${Object.keys(orgs.byId).length} | omitidas → inactivas: ${orgs.skipped.inactive}, sin credenciales: ${orgs.skipped.sinCredenciales}, región inválida: ${orgs.skipped.regionInvalida}`,
+      `[Cron] [${currentTimestamp()}] Organizaciones activas: ${Object.keys(orgs.byId).length} | omitidas → inactivas: ${orgs.skipped.inactive}, sin credenciales: ${orgs.skipped.sinCredenciales}, región inválida: ${orgs.skipped.regionInvalida}`,
     );
 
     if (Object.keys(orgs.byId).length === 0) {
-      console.log("[Cron] No hay organizaciones activas con credenciales. Fin.");
+      console.log(`[Cron] [${currentTimestamp()}] No hay organizaciones activas con credenciales. Fin.`);
       return { organizaciones: 0 };
     }
 
     const { jobs, stats } = await buildOrgJobs(orgs);
     console.log(
-      `[Cron] Usuarios: ${stats.usuarios} | notificables: ${stats.notificables} | omitidos → inactivos: ${stats.inactivos}, sin notificaciones: ${stats.sinNotificaciones}, sin destinatarios: ${stats.sinDestinatarios}, sin org activa: ${stats.sinOrgActiva}`,
+      `[Cron] [${currentTimestamp()}] Usuarios: ${stats.usuarios} | notificables: ${stats.notificables} | omitidos → inactivos: ${stats.inactivos}, sin notificaciones: ${stats.sinNotificaciones}, sin destinatarios: ${stats.sinDestinatarios}, sin org activa: ${stats.sinOrgActiva}`,
     );
 
     const hourKey = currentHourKey();
@@ -223,36 +256,45 @@ async function runDailyMonitor() {
       try {
         await enqueueOrgMonitor(jobs[orgId], hourKey);
       } catch (error) {
-        console.error(`[Cron] No se pudo encolar la org ${orgId}:`, error.message);
+        console.error(`[Cron] [${currentTimestamp()}] No se pudo encolar la org ${orgId}:`, error.message);
       }
     }
 
     console.log(
-      `🏁 [Cron] ${orgIds.length} organizaciones encoladas en ${Date.now() - started}ms.`,
+      `🏁 [Cron] [${currentTimestamp()}] ${orgIds.length} organizaciones encoladas en ${Date.now() - started}ms.`,
     );
 
     return { organizaciones: orgIds.length, usuarios: stats.notificables, hourKey };
   } catch (error) {
-    console.error("❌ [Cron] Error general en el monitor:", error);
+    console.error(`❌ [Cron] [${currentTimestamp()}] Error general en el monitor:`, error);
+    notifyPlatformError({
+      source: "monitor",
+      title: "Error general en el monitor horario",
+      message: error.message,
+    });
     throw error;
   }
 }
 
 function initCron() {
   cron.schedule(CRON_EXPRESSION, () => {
+    const triggerTime = currentTimestamp();
+    console.log(`\n⏰ [Cron Trigger] [${triggerTime}] Disparo programado ejecutado.`);
     runDailyMonitor().catch((err) =>
-      console.error("❌ [Cron] Ejecución programada falló:", err.message),
+      console.error(`❌ [Cron] [${currentTimestamp()}] Ejecución programada falló:`, err.message),
     );
   });
-  console.log(`🕰️ [Cron] Orquestador inicializado con la expresión "${CRON_EXPRESSION}".`);
+  console.log(`[${currentTimestamp()}] 🕰️ [Cron] Orquestador inicializado con la expresión "${CRON_EXPRESSION}".`);
 
   // Purga diaria del log de accesos: sin ella la colección crece sin techo.
   cron.schedule(LOG_PURGE_CRON, () => {
+    const purgeTime = currentTimestamp();
+    console.log(`\n🧹 [Cron] [${purgeTime}] Iniciando purga diaria de logs programada...`);
     purgeOldLogs().catch((err) =>
-      console.error("❌ [Cron] Purga de logs falló:", err.message),
+      console.error(`❌ [Cron] [${currentTimestamp()}] Purga de logs falló:`, err.message),
     );
   });
-  console.log(`🧹 [Cron] Purga de logs programada con la expresión "${LOG_PURGE_CRON}".`);
+  console.log(`[${currentTimestamp()}] 🧹 [Cron] Purga de logs programada con la expresión "${LOG_PURGE_CRON}".`);
 }
 
 module.exports = {

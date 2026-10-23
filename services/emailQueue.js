@@ -8,6 +8,7 @@ const {
 const { getEmailSettings } = require("../utils/appSettings");
 const { notificationsBlocked, blockedReason } = require("../utils/environment");
 const { languageForRecipients } = require("../utils/userLanguage");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 // IONOS limita el envío por hora y las conexiones simultáneas. El limiter de
 // BullMQ es global a la cola (compartido entre réplicas vía Redis), así que
@@ -21,6 +22,11 @@ const QUEUE_NAME = "EmailsQueue";
 
 let emailQueue = null;
 let emailWorker = null;
+
+function safeJobId(raw) {
+  if (!raw) return undefined;
+  return String(raw).replace(/:/g, "_");
+}
 
 if (isQueueEnabled()) {
   emailQueue = new Queue(QUEUE_NAME, {
@@ -48,14 +54,23 @@ if (isQueueEnabled()) {
   );
 
   emailWorker.on("completed", (job) => {
-    console.log(`✅ [Worker] Job ${job.id} de correo enviado a ${job.data.to}`);
+    console.log(`[${new Date().toISOString()}] ✅ [Worker] Job ${job.id} de correo enviado a ${job.data.to}`);
   });
 
   emailWorker.on("failed", (job, err) => {
     console.error(
-      `❌ [Worker] Job ${job?.id} falló al enviar correo a ${job?.data?.to}:`,
+      `[${new Date().toISOString()}] ❌ [Worker] Job ${job?.id} falló al enviar correo a ${job?.data?.to}:`,
       err.message,
     );
+    if (job && job.attemptsMade >= (job.opts.attempts || 1)) {
+      notifyPlatformError({
+        source: "email",
+        title: "Fallo al enviar correo",
+        message: `No se pudo enviar '${job.data?.tipo}' a ${job.data?.to} tras ${job.attemptsMade} intentos: ${err.message}`,
+        // Un SMTP caído falla en todos los correos: un solo aviso por ventana.
+        key: "email|send_failed",
+      });
+    }
   });
 } else {
   console.log("⚠️ [Queue] BullMQ desactivado (Modo DEV sin Redis). Los envíos serán síncronos.");
@@ -160,12 +175,12 @@ async function enqueueEmail(tipo, data, to, isNotification = false, options = {}
     name: "send-email",
     data: { tipo, data, to: [recipient], isNotification },
     opts: options.dedupeKey
-      ? { jobId: `${options.dedupeKey}:${recipient}` }
+      ? { jobId: safeJobId(`${options.dedupeKey}_${recipient}`) }
       : undefined,
   }));
 
   await emailQueue.addBulk(jobs);
-  console.log(`📥 [Queue] Encolados ${jobs.length} correos de tipo '${tipo}'`);
+  console.log(`[${new Date().toISOString()}] 📥 [Queue] Encolados ${jobs.length} correos de tipo '${tipo}'`);
   return { enqueued: jobs.length };
 }
 

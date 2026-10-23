@@ -81,6 +81,11 @@ function extractToken(req) {
 const PUBLIC_PATHS = new Set([
   "/api/login",
   "/api/health",
+  // Restablecimiento de contraseña: quien lo usa, por definición, no puede
+  // iniciar sesión. Se protegen con el token de un solo uso y límites de ritmo.
+  "/api/password/forgot",
+  "/api/password/reset/validate",
+  "/api/password/reset",
 ]);
 
 /**

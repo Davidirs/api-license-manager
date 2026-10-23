@@ -88,6 +88,11 @@ function formatTrusteeBilling(billingData) {
     "TrueEngage Omnichannel Web & App Customer Contact",
     "Genesys Cloud IVR Basic Per Minute Charge",
     "Genesys Cloud API Resource Usage",
+    "WhatsApp Authentication Conversation Pass-Through",
+    "WhatsApp Marketing Conversation Pass-Through",
+    "WhatsApp Service Conversation Pass-Through",
+    "WhatsApp Template Message",
+    "WhatsApp Utility Conversation Pass-Through",
   ];
 
   const listNameAddons = [
@@ -214,20 +219,24 @@ function formatTrusteeBilling(billingData) {
 
   for (let index = 0; index < listTokensFounded.length; index++) {
     const token = listTokensFounded[listTokensFounded.length - 1 - index];
-    if (token.overageQuantity === 0 && token.prepayQuantity === 0) {
-      tokensUnified.incluido = Number(token.usageQuantity);
+    // Genesys devuelve las cantidades como texto: `"0" === 0` es falso, así que
+    // la entrada de tokens incluidos nunca se reconocía y podía pisar a la de
+    // tokens prepagados con ceros. Se compara siempre con números.
+    const prepay = toNumber(token.prepayQuantity);
+    const usage = toNumber(token.usageQuantity);
+    if (token.overageQuantity === 0 && prepay === 0) {
+      tokensUnified.incluido = usage;
     } else {
       tokensUnified.name = token.name;
-      tokensUnified.prepayQuantity = Number(token.prepayQuantity);
-      tokensUnified.usageQuantity = Number(token.usageQuantity);
+      tokensUnified.prepayQuantity = prepay;
+      tokensUnified.usageQuantity = usage;
       tokensUnified.overageQuantity =
-        token.prepayQuantity > 0
-          ? token.usageQuantity >
-            Number(token.prepayQuantity) + Number(tokensUnified.incluido)
-            ? token.usageQuantity - token.prepayQuantity
+        prepay > 0
+          ? usage > prepay + tokensUnified.incluido
+            ? usage - prepay
             : 0
-          : token.usageQuantity > tokensUnified.incluido
-            ? token.usageQuantity - tokensUnified.incluido
+          : usage > tokensUnified.incluido
+            ? usage - tokensUnified.incluido
             : 0;
     }
   }
@@ -244,21 +253,39 @@ function formatTrusteeBilling(billingData) {
     facturacion: {
       // subscriptionoverview puede usar periodStartDate/periodEndDate
       // trusteebillingoverview usa billingPeriodStartDate/billingPeriodEndDate
-      inicio: billingData.billingPeriodStartDate || billingData.periodStartDate || billingData.startDate || null,
-      final: billingData.billingPeriodEndDate || billingData.periodEndDate || billingData.endDate || null,
+      inicio:
+        billingData.billingPeriodStartDate ||
+        billingData.periodStartDate ||
+        billingData.startDate ||
+        null,
+      final:
+        billingData.billingPeriodEndDate ||
+        billingData.periodEndDate ||
+        billingData.endDate ||
+        null,
     },
     rampUp: {
       // rampPeriod puede no existir en subscriptionoverview; usamos la facturación como fallback
-      inicio: billingData.rampPeriodStartDate || billingData.billingPeriodStartDate || billingData.periodStartDate || null,
-      final: billingData.rampPeriodEndDate || billingData.billingPeriodEndDate || billingData.periodEndDate || null,
+      inicio:
+        billingData.rampPeriodStartDate ||
+        billingData.billingPeriodStartDate ||
+        billingData.periodStartDate ||
+        null,
+      final:
+        billingData.rampPeriodEndDate ||
+        billingData.billingPeriodEndDate ||
+        billingData.periodEndDate ||
+        null,
     },
     storage: {
       comprometido: storage?.prepayQuantity ?? 0,
       enUso: storage?.usageQuantity ?? 0,
-      overageQuantity:
-        (storage?.prepayQuantity || 0) > (storage?.usageQuantity || 0)
-          ? 0
-          : (storage?.usageQuantity || 0) - (storage?.prepayQuantity || 0),
+      // Antes se comparaban los textos ("1475" > "98" es falso por orden
+      // alfabético) y con subutilización salía un sobreuso negativo.
+      overageQuantity: Math.max(
+        0,
+        toNumber(storage?.usageQuantity) - toNumber(storage?.prepayQuantity),
+      ),
     },
     iaTokens: tokensUnified,
     addons: listAddonsFounded,
@@ -272,6 +299,12 @@ function formatTrusteeBilling(billingData) {
 
 function buscarPorNombre(lista, nombreBuscado) {
   return lista.find((item) => item.name === nombreBuscado) || null;
+}
+
+/** Cantidad de Genesys (texto, número o ausente) como número; 0 si no es válida. */
+function toNumber(value) {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
 }
 
 module.exports = {

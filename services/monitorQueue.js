@@ -12,12 +12,18 @@ const { Queue, Worker } = require("bullmq");
 const { getRedisConnection, isQueueEnabled } = require("./redisConnection");
 const { processOrgMonitor } = require("./monitorProcessor");
 const { db } = require("../firebase");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 const QUEUE_NAME = "MonitorQueue";
 const MONITOR_CONCURRENCY = Number(process.env.MONITOR_CONCURRENCY) || 5;
 
 let monitorQueue = null;
 let monitorWorker = null;
+
+function safeJobId(raw) {
+  if (!raw) return undefined;
+  return String(raw).replace(/:/g, "_");
+}
 
 if (isQueueEnabled()) {
   monitorQueue = new Queue(QUEUE_NAME, {
@@ -36,7 +42,7 @@ if (isQueueEnabled()) {
       const started = Date.now();
       const summary = await processOrgMonitor(job.data);
       console.log(
-        `✅ [Monitor] ${summary.orgname} procesada en ${Date.now() - started}ms | alertas: ${summary.alerts} · recuperadas: ${summary.recovered} · actual: ${summary.currentReports} · final: ${summary.finalReports}`,
+        `[${new Date().toISOString()}] ✅ [Monitor] ${summary.orgname} procesada en ${Date.now() - started}ms | alertas: ${summary.alerts} · recuperadas: ${summary.recovered} · actual: ${summary.currentReports} · final: ${summary.finalReports} · whatsapp: ${summary.whatsapp}`,
       );
       return summary;
     },
@@ -48,13 +54,20 @@ if (isQueueEnabled()) {
 
   monitorWorker.on("failed", async (job, err) => {
     console.error(
-      `❌ [Monitor] Org ${job?.data?.orgname} (${job?.data?.orgId}) falló (intento ${job?.attemptsMade}):`,
+      `[${new Date().toISOString()}] ❌ [Monitor] Org ${job?.data?.orgname} (${job?.data?.orgId}) falló (intento ${job?.attemptsMade}):`,
       err.message,
     );
 
     // Sólo al agotar los reintentos se marca el fallo, para que el estado de
     // salud no muestre errores transitorios ya resueltos.
     if (job && job.attemptsMade >= (job.opts.attempts || 1) && job.data?.orgId) {
+      notifyPlatformError({
+        source: "monitor",
+        title: `Monitoreo fallido: ${job.data.orgname || job.data.orgId}`,
+        message: `El monitoreo de la organización falló tras ${job.attemptsMade} intentos: ${err.message}`,
+        detail: { orgId: job.data.orgId },
+        key: `monitor|${job.data.orgId}`,
+      });
       try {
         await db
           .collection("organizations")
@@ -88,7 +101,7 @@ async function enqueueOrgMonitor(orgJob, hourKey) {
   }
 
   await monitorQueue.add("monitor-org", orgJob, {
-    jobId: `monitor:${orgJob.orgId}:${hourKey}`,
+    jobId: safeJobId(`monitor_${orgJob.orgId}_${hourKey}`),
   });
   return { enqueued: true, orgId: orgJob.orgId };
 }
