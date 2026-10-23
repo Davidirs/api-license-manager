@@ -14,6 +14,8 @@ const { db } = require("../firebase");
 const { enqueueOrgMonitor } = require("./monitorQueue");
 const { isKnownRegion } = require("../utils/genesysRegions");
 const { purgeOldLogs } = require("../utils/auditLog");
+const { isOrgWhatsappEnabled, normalizeNumbers } = require("../utils/whaibot");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 const PAGE_SIZE = Number(process.env.MONITOR_FIRESTORE_PAGE_SIZE) || 500;
 const CRON_EXPRESSION = process.env.MONITOR_CRON || "0 * * * *";
@@ -28,6 +30,22 @@ function isActive(entity) {
   return entity?.active !== false;
 }
 
+/** Correos del usuario, sólo si tiene activadas las notificaciones por correo. */
+function emailRecipientsOf(user) {
+  return user.preferences?.emailNotifications ? user.preferences?.recipients || [] : [];
+}
+
+/**
+ * Número de WhatsApp del usuario, sólo si él mismo lo activó y lo verificó con
+ * el código (`whatsappVerifiedAt`). Si su organización tiene WhatsApp
+ * habilitado se decide en el worker, por org.
+ */
+function whatsappRecipientsOf(user) {
+  const prefs = user.preferences || {};
+  if (!prefs.whatsappNotifications || !prefs.whatsappVerifiedAt) return [];
+  return normalizeNumbers(prefs.whatsappRecipients || []).slice(0, 1);
+}
+
 /** Sólo se conservan los campos que el worker necesita: los jobs viajan por Redis. */
 function compactUser(user) {
   return {
@@ -35,7 +53,11 @@ function compactUser(user) {
     role: user.role,
     orgname: user.orgname,
     preferences: {
-      recipients: user.preferences?.recipients || [],
+      // Vacío si el usuario desactivó el correo: puede quedar sólo con WhatsApp.
+      recipients: emailRecipientsOf(user),
+      whatsappRecipients: whatsappRecipientsOf(user),
+      whatsappTemplates: user.preferences?.whatsappTemplates || {},
+      whatsappQuietHours: user.preferences?.whatsappQuietHours || null,
       alertThreshold: user.preferences?.alertThreshold,
       notificationDays: user.preferences?.notificationDays || [],
       notificationTime: user.preferences?.notificationTime || "08:00",
@@ -106,6 +128,7 @@ async function loadActiveOrganizations() {
       region: org.region,
       clientId: org.clientId,
       clientSecret: org.clientSecret,
+      whatsappEnabled: isOrgWhatsappEnabled(org),
     };
 
     byId[org.orgId] = entry;
@@ -158,12 +181,15 @@ async function buildOrgJobs(orgs) {
       continue;
     }
 
-    if (!user.preferences?.emailNotifications) {
+    const wantsEmail = Boolean(user.preferences?.emailNotifications);
+    const wantsWhatsapp = Boolean(user.preferences?.whatsappNotifications);
+
+    if (!wantsEmail && !wantsWhatsapp) {
       stats.sinNotificaciones += 1;
       continue;
     }
 
-    if ((user.preferences?.recipients || []).length === 0) {
+    if (emailRecipientsOf(user).length === 0 && whatsappRecipientsOf(user).length === 0) {
       stats.sinDestinatarios += 1;
       continue;
     }
@@ -241,6 +267,11 @@ async function runDailyMonitor() {
     return { organizaciones: orgIds.length, usuarios: stats.notificables, hourKey };
   } catch (error) {
     console.error(`❌ [Cron] [${currentTimestamp()}] Error general en el monitor:`, error);
+    notifyPlatformError({
+      source: "monitor",
+      title: "Error general en el monitor horario",
+      message: error.message,
+    });
     throw error;
   }
 }

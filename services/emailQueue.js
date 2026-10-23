@@ -8,6 +8,7 @@ const {
 const { getEmailSettings } = require("../utils/appSettings");
 const { notificationsBlocked, blockedReason } = require("../utils/environment");
 const { languageForRecipients } = require("../utils/userLanguage");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 // IONOS limita el envío por hora y las conexiones simultáneas. El limiter de
 // BullMQ es global a la cola (compartido entre réplicas vía Redis), así que
@@ -61,6 +62,15 @@ if (isQueueEnabled()) {
       `[${new Date().toISOString()}] ❌ [Worker] Job ${job?.id} falló al enviar correo a ${job?.data?.to}:`,
       err.message,
     );
+    if (job && job.attemptsMade >= (job.opts.attempts || 1)) {
+      notifyPlatformError({
+        source: "email",
+        title: "Fallo al enviar correo",
+        message: `No se pudo enviar '${job.data?.tipo}' a ${job.data?.to} tras ${job.attemptsMade} intentos: ${err.message}`,
+        // Un SMTP caído falla en todos los correos: un solo aviso por ventana.
+        key: "email|send_failed",
+      });
+    }
   });
 } else {
   console.log("⚠️ [Queue] BullMQ desactivado (Modo DEV sin Redis). Los envíos serán síncronos.");

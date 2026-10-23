@@ -216,6 +216,59 @@ async function fetchOutboundAttempts(token, region, startDate, endDate) {
   return { totalAttempts };
 }
 
+/** Offset UTC de `timezone` en el día `day` (YYYY-MM-DD), p. ej. "-06:00"; "Z" si es UTC o no se reconoce. */
+function timezoneOffset(timezone, day) {
+  if (!timezone) return "Z";
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", { timeZone: timezone, timeZoneName: "longOffset" });
+    const name = formatter.formatToParts(new Date(`${day}T12:00:00Z`)).find((p) => p.type === "timeZoneName").value;
+    return name.replace("GMT", "") || "Z";
+  } catch (e) {
+    console.error("Error al calcular timezone offset", e);
+    return "Z";
+  }
+}
+
+/**
+ * Intentos de outbound por campaña, tal como los muestra el dashboard
+ * (/api/reports/outbound-attempts): días completos en la zona horaria del
+ * usuario, sólo conversaciones outbound y sólo las que tienen campaña.
+ * Las campañas salen con su id como nombre; resolver los nombres queda para
+ * quien los necesite.
+ */
+async function fetchOutboundCampaignAttempts(token, region, startDate, endDate, timezone) {
+  const interval = `${startDate}T00:00:00.000${timezoneOffset(timezone, startDate)}/${endDate}T23:59:59.999${timezoneOffset(timezone, endDate)}`;
+
+  const body = {
+    interval,
+    groupBy: ["outboundCampaignId"],
+    metrics: ["nOutboundAttempted"],
+    filter: {
+      type: "and",
+      predicates: [{ type: "dimension", dimension: "direction", operator: "matches", value: "outbound" }],
+    },
+  };
+
+  const data = await genesysFetch(
+    `${getApiUrl(region)}/api/v2/analytics/conversations/aggregates/query`,
+    token,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+
+  let totalAttempts = 0;
+  const campaigns = [];
+  for (const result of data.results || []) {
+    const campaignId = result.group?.outboundCampaignId;
+    if (!campaignId) continue;
+    const metric = (result.data?.[0]?.metrics || []).find((m) => m.metric === "nOutboundAttempted");
+    const count = metric?.stats?.count || 0;
+    totalAttempts += count;
+    campaigns.push({ id: campaignId, name: campaignId, attempts: count });
+  }
+
+  return { totalAttempts, campaigns };
+}
+
 module.exports = {
   genesysFetch,
   fetchBillingPeriods,
@@ -223,6 +276,7 @@ module.exports = {
   fetchCurrentPeriod,
   fetchCompletedPeriod,
   fetchOutboundAttempts,
+  fetchOutboundCampaignAttempts,
   periodId,
   periodIdFromPeriod,
   isoDay,

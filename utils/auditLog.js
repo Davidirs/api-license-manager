@@ -42,6 +42,7 @@ const EVENT = {
   ORG_UPDATED: "org_updated",
   ORG_STATUS_CHANGED: "org_status_changed",
   ORG_AI_CHANGED: "org_ai_changed",
+  ORG_WHATSAPP_CHANGED: "org_whatsapp_changed",
   EMAIL_SETTINGS_UPDATED: "email_settings_updated",
   INTEGRATION_UPDATED: "integration_updated",
   EMAIL_SENT: "email_sent",

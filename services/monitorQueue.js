@@ -12,6 +12,7 @@ const { Queue, Worker } = require("bullmq");
 const { getRedisConnection, isQueueEnabled } = require("./redisConnection");
 const { processOrgMonitor } = require("./monitorProcessor");
 const { db } = require("../firebase");
+const { notifyPlatformError } = require("../utils/platformAlerts");
 
 const QUEUE_NAME = "MonitorQueue";
 const MONITOR_CONCURRENCY = Number(process.env.MONITOR_CONCURRENCY) || 5;
@@ -41,7 +42,7 @@ if (isQueueEnabled()) {
       const started = Date.now();
       const summary = await processOrgMonitor(job.data);
       console.log(
-        `[${new Date().toISOString()}] ✅ [Monitor] ${summary.orgname} procesada en ${Date.now() - started}ms | alertas: ${summary.alerts} · recuperadas: ${summary.recovered} · actual: ${summary.currentReports} · final: ${summary.finalReports}`,
+        `[${new Date().toISOString()}] ✅ [Monitor] ${summary.orgname} procesada en ${Date.now() - started}ms | alertas: ${summary.alerts} · recuperadas: ${summary.recovered} · actual: ${summary.currentReports} · final: ${summary.finalReports} · whatsapp: ${summary.whatsapp}`,
       );
       return summary;
     },
@@ -60,6 +61,13 @@ if (isQueueEnabled()) {
     // Sólo al agotar los reintentos se marca el fallo, para que el estado de
     // salud no muestre errores transitorios ya resueltos.
     if (job && job.attemptsMade >= (job.opts.attempts || 1) && job.data?.orgId) {
+      notifyPlatformError({
+        source: "monitor",
+        title: `Monitoreo fallido: ${job.data.orgname || job.data.orgId}`,
+        message: `El monitoreo de la organización falló tras ${job.attemptsMade} intentos: ${err.message}`,
+        detail: { orgId: job.data.orgId },
+        key: `monitor|${job.data.orgId}`,
+      });
       try {
         await db
           .collection("organizations")

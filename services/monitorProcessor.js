@@ -15,6 +15,9 @@ const {
   todayUtc,
 } = require("./genesysBilling");
 const { enqueueEmail } = require("./emailQueue");
+const { enqueueWhatsapp } = require("./whatsappQueue");
+const { buildWhatsappMessage } = require("../utils/whatsappMessages");
+const { quietHoursDelayMs } = require("../utils/quietHours");
 const {
   STATUS,
   evaluateOrg,
@@ -91,6 +94,28 @@ function parseHour(value) {
 
 function recipientsOf(user) {
   return [...new Set((user?.preferences?.recipients || []).filter(Boolean))];
+}
+
+/**
+ * Números de WhatsApp del usuario para esta organización. El orquestador ya
+ * descartó los de usuarios que no lo activaron; aquí falta la llave de la org.
+ */
+function whatsappOf(user, orgWhatsappEnabled) {
+  if (!orgWhatsappEnabled) return [];
+  return [...new Set((user?.preferences?.whatsappRecipients || []).filter(Boolean))];
+}
+
+/**
+ * ¿Quiere el usuario esta plantilla por WhatsApp? Elige dentro de lo que el
+ * admin permite (eso se comprueba en la cola); sin preferencia, la recibe.
+ */
+function userWantsWhatsapp(user, tipo) {
+  return user?.preferences?.whatsappTemplates?.[tipo] !== false;
+}
+
+/** ¿Tiene el usuario algún canal por el que notificarle? */
+function hasChannel(user, orgWhatsappEnabled) {
+  return recipientsOf(user).length > 0 || whatsappOf(user, orgWhatsappEnabled).length > 0;
 }
 
 /** Idioma de las plantillas para un usuario. Sin preferencia, español. */
@@ -213,9 +238,36 @@ function previousNames(previousState) {
  */
 async function processOrgMonitor(jobData) {
   const { orgId, orgname, region, users = [] } = jobData;
+  const orgWhatsappEnabled = jobData.whatsappEnabled === true;
+  const whatsappFor = (user) => whatsappOf(user, orgWhatsappEnabled);
+
+  /**
+   * WhatsApp por usuario (no por grupo de idioma como el correo): cada uno
+   * tiene sus plantillas elegidas, su horario de no molestar y su zona horaria.
+   * El mensaje es un resumen que remite al correo o al dashboard.
+   */
+  const notifyWhatsapp = async (tipo, user, data, dedupeKey) => {
+    const numbers = whatsappFor(user);
+    if (numbers.length === 0 || !userWantsWhatsapp(user, tipo)) return;
+    const delayMs = quietHoursDelayMs(user.preferences?.whatsappQuietHours, user.preferences?.timezone);
+    const message = buildWhatsappMessage(tipo, {
+      ...data,
+      lang: languageOf(user),
+      hasEmail: recipientsOf(user).length > 0,
+      delayed: delayMs > 0,
+    });
+    const { enqueued } = await enqueueWhatsapp(
+      tipo,
+      { message, orgId, orgname },
+      numbers,
+      { dedupeKey, delayMs },
+    );
+    summary.whatsapp += enqueued;
+  };
   const summary = {
     orgId,
     orgname,
+    whatsapp: 0,
     alerts: 0,
     recovered: 0,
     currentReports: 0,
@@ -296,6 +348,14 @@ async function processOrgMonitor(jobData) {
         );
         summary.alerts += recipients.length;
       }
+      for (const user of usersForThreshold) {
+        await notifyWhatsapp(
+          "alert",
+          user,
+          { client, critical: evaluation.critical, threshold },
+          `alert:${orgId}:${threshold}:${shortHash(evaluation.signature)}`,
+        );
+      }
     }
 
     if (decision.action === "recovered") {
@@ -319,6 +379,14 @@ async function processOrgMonitor(jobData) {
           { dedupeKey: `recovered:${orgId}:${threshold}:${current.periodId}` },
         );
         summary.recovered += recipients.length;
+      }
+      for (const user of usersForThreshold) {
+        await notifyWhatsapp(
+          "recovered",
+          user,
+          { client, critical: evaluation.critical, threshold, resolved },
+          `recovered:${orgId}:${threshold}:${current.periodId}`,
+        );
       }
     }
 
@@ -359,7 +427,7 @@ async function processOrgMonitor(jobData) {
 
     const pendingUsers = users.filter((u) => {
       if (alreadyNotified.has(u.username)) return false;
-      if (recipientsOf(u).length === 0) return false;
+      if (!hasChannel(u, orgWhatsappEnabled)) return false;
       const local = localTimeFor(u.preferences?.timezone);
       // Dentro de la ventana basta con que su hora del día ya haya llegado.
       return local.hour >= parseHour(u.preferences?.notificationTime);
@@ -383,20 +451,17 @@ async function processOrgMonitor(jobData) {
       for (const user of pendingUsers) {
         const threshold = thresholdFor(user);
         const evaluation = evaluateOrg(completedClient, extras, threshold);
-        await enqueueEmail(
-          "previous",
-          {
-            client: completedClient,
-            kpis: evaluation.kpis,
-            critical: evaluation.critical,
-            threshold,
-            estimatedCost: evaluation.estimatedCost,
-            lang: languageOf(user),
-          },
-          recipientsOf(user),
-          true,
-          { dedupeKey: `previous:${orgId}:${completedId}:${user.username}` },
-        );
+        const payload = {
+          client: completedClient,
+          kpis: evaluation.kpis,
+          critical: evaluation.critical,
+          threshold,
+          estimatedCost: evaluation.estimatedCost,
+          lang: languageOf(user),
+        };
+        const dedupeKey = `previous:${orgId}:${completedId}:${user.username}`;
+        await enqueueEmail("previous", payload, recipientsOf(user), true, { dedupeKey });
+        await notifyWhatsapp("previous", user, payload, dedupeKey);
         notified.add(user.username);
         summary.finalReports += 1;
       }
@@ -414,8 +479,8 @@ async function processOrgMonitor(jobData) {
 
   // ── Reporte programado del período en curso ───────────────────────────────
   for (const user of users) {
+    if (!hasChannel(user, orgWhatsappEnabled)) continue;
     const recipients = recipientsOf(user);
-    if (recipients.length === 0) continue;
 
     const local = localTimeFor(user.preferences?.timezone);
     const scheduledHour = parseHour(user.preferences?.notificationTime);
@@ -436,22 +501,19 @@ async function processOrgMonitor(jobData) {
     const threshold = thresholdFor(user);
     const evaluation = evaluations.get(threshold) || evaluateOrg(client, extras, threshold);
 
-    await enqueueEmail(
-      "current",
-      {
-        client,
-        kpis: evaluation.kpis,
-        critical: evaluation.critical,
-        threshold,
-        estimatedCost: evaluation.estimatedCost,
-        periodClosed: current.periodClosed,
-        projection: buildProjection(client, evaluation.kpis),
-        lang: languageOf(user),
-      },
-      recipients,
-      true,
-      { dedupeKey: `current:${orgId}:${user.username}:${local.dateKey}` },
-    );
+    const payload = {
+      client,
+      kpis: evaluation.kpis,
+      critical: evaluation.critical,
+      threshold,
+      estimatedCost: evaluation.estimatedCost,
+      periodClosed: current.periodClosed,
+      projection: buildProjection(client, evaluation.kpis),
+      lang: languageOf(user),
+    };
+    const dedupeKey = `current:${orgId}:${user.username}:${local.dateKey}`;
+    await enqueueEmail("current", payload, recipients, true, { dedupeKey });
+    await notifyWhatsapp("current", user, payload, dedupeKey);
     summary.currentReports += 1;
   }
 

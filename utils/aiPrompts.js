@@ -29,6 +29,8 @@ const PROMPTS = {
     metricsOutbound: "Resumen de intentos outbound y campañas:",
     metricsOverage: "Detalles de sobreuso y últimos inicios de sesión:",
     metricsNoOverage: "No hay sobreuso de licencias detectado.",
+    metricsFairUse:
+      "Fair use calculado por el servidor (BYOC Cloud e intentos outbound se miden contra este límite, no contra lo prepagado):",
 
     comparisonIntro:
       "Analiza la siguiente comparativa de métricas de Genesys Cloud entre periodos de facturación:",
@@ -66,6 +68,8 @@ const PROMPTS = {
     metricsOutbound: "Outbound attempts and campaigns summary:",
     metricsOverage: "Overage details and most recent logins:",
     metricsNoOverage: "No license overage detected.",
+    metricsFairUse:
+      "Fair use calculated by the server (BYOC Cloud and outbound attempts are measured against this limit, not against the prepaid amount):",
 
     comparisonIntro:
       "Analyze the following comparison of Genesys Cloud metrics across billing periods:",
@@ -103,6 +107,8 @@ const PROMPTS = {
     metricsOutbound: "Resumo de tentativas outbound e campanhas:",
     metricsOverage: "Detalhes de sobreuso e últimos inícios de sessão:",
     metricsNoOverage: "Nenhum sobreuso de licenças detectado.",
+    metricsFairUse:
+      "Fair use calculado pelo servidor (BYOC Cloud e tentativas outbound são medidos contra este limite, não contra o pré-pago):",
 
     comparisonIntro:
       "Analise a seguinte comparação de métricas do Genesys Cloud entre períodos de faturamento:",
