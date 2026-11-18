@@ -107,6 +107,8 @@ const {
 // Envío de correo por SMTP (IONOS). Sustituye a Resend.
 const { sendMail, verifyTransport, smtpConfig } = require("./utils/mailer");
 const { fetchOrgToken, isKnownRegion } = require("./utils/genesysRegions");
+const { getTrunksRealtime, getCertificatesRealtime } = require("./services/genesysRealtime");
+const { getDataActionsPerformance } = require("./services/genesysDataActions");
 const { fetchOutboundCampaignAttempts } = require("./services/genesysBilling");
 // KPIs del informe y fair use (BYOC, outbound, IVR) calculados en el servidor.
 const {
@@ -598,6 +600,196 @@ app.post("/api/logout", (req, res) => {
   return res.status(200).json({ success: true, message: "Sesión cerrada." });
 });
 
+// ─── Vista multi-organización (supervisores y administradores) ──────────────
+//
+// Un supervisor ve, desde una sola pantalla, todas las organizaciones a las
+// que tiene acceso: las que comparten alguno de sus ambientes `thrusted` más la
+// suya propia (mismo criterio que /api/login). El administrador ve todas.
+//
+// Los datos de cada tarjeta se cargan con el token de la PROPIA organización
+// (sus clientId/clientSecret). Antes el panel usaba el token del `thrusted`
+// (p. ej. ESMT-DEV) y Genesys devolvía la suscripción de ESMT-DEV para todas.
+
+/** Normaliza `thrusted`: string simple, string con comas o array. */
+function normalizeThrustedList(thrusted) {
+  if (Array.isArray(thrusted)) {
+    return thrusted.map((s) => String(s).trim()).filter(Boolean);
+  }
+  if (typeof thrusted === "string" && thrusted.trim()) {
+    return thrusted.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * Organizaciones (documentos crudos, con credenciales) que puede ver quien
+ * llama. El rol y el ámbito salen siempre del usuario en Firestore, no del JWT,
+ * para que un cambio de ambientes o una desactivación aplique de inmediato.
+ */
+async function getAccessibleOrgDocs(req) {
+  const username = req.auth?.sub;
+  if (!username) return { userFound: null, docs: [] };
+
+  const userDoc = await db.collection("users").doc(username).get();
+  if (!userDoc.exists) return { userFound: null, docs: [] };
+  const userFound = userDoc.data();
+  if (userFound.active === false) return { userFound, docs: [] };
+
+  const orgsSnapshot = await db.collection("organizations").get();
+  if (userFound.role === "administrator") {
+    return { userFound, docs: orgsSnapshot.docs };
+  }
+  if (userFound.role !== "supervisor") return { userFound, docs: [] };
+
+  const thrustedSet = new Set(normalizeThrustedList(userFound.thrusted));
+  const docs = orgsSnapshot.docs.filter((doc) => {
+    const org = doc.data();
+    return thrustedSet.has(org.thrusted) || org.orgname === userFound.orgname;
+  });
+  return { userFound, docs };
+}
+
+/** Busca una org accesible por orgId (campo o id del documento). */
+async function findAccessibleOrg(req, orgId) {
+  const { userFound, docs } = await getAccessibleOrgDocs(req);
+  const doc = docs.find((d) => d.id === orgId || d.data().orgId === orgId);
+  return { userFound, doc };
+}
+
+// Listado de organizaciones accesibles (sin credenciales).
+app.get(
+  "/api/supervisor/orgs",
+  requireRole("supervisor", "administrator"),
+  async (req, res) => {
+    try {
+      const { docs } = await getAccessibleOrgDocs(req);
+      const orgs = docs
+        .map((doc) => {
+          const clean = sanitizeOrg({ ...doc.data() });
+          return {
+            orgId: clean.orgId || doc.id,
+            orgname: clean.orgname || doc.id,
+            region: clean.region || "us-east-1",
+            thrusted: clean.thrusted || "",
+            active: clean.active !== false,
+            hasCredentials: clean.hasCredentials,
+            criticalMetrics: clean.criticalMetrics || [],
+          };
+        })
+        .sort((a, b) => String(a.orgname).localeCompare(String(b.orgname)));
+      return res.status(200).json({ success: true, orgs });
+    } catch (error) {
+      console.error("❌ Error en GET /api/supervisor/orgs:", error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+  },
+);
+
+// Token de Genesys de UNA organización, para cargar sus datos en la tarjeta.
+app.post(
+  "/api/supervisor/org-token",
+  requireRole("supervisor", "administrator"),
+  async (req, res) => {
+    try {
+      const { orgId } = req.body || {};
+      if (!orgId) {
+        return res.status(400).json({ success: false, message: "orgId requerido." });
+      }
+      const { doc } = await findAccessibleOrg(req, orgId);
+      if (!doc) {
+        return res.status(403).json({
+          success: false,
+          message: "No tienes acceso a esta organización.",
+        });
+      }
+      const org = doc.data();
+      if (!org.clientId || !org.clientSecret) {
+        return res.status(422).json({
+          success: false,
+          code: "NO_CREDENTIALS",
+          message: `La organización "${org.orgname}" no tiene credenciales configuradas.`,
+        });
+      }
+      const token = await getTokenForRegion(org.clientId, org.clientSecret, org.region);
+      return res.status(200).json({
+        success: true,
+        token,
+        orgId: org.orgId || doc.id,
+        orgname: org.orgname,
+        region: org.region || "us-east-1",
+      });
+    } catch (error) {
+      console.error("❌ Error en POST /api/supervisor/org-token:", error);
+      return res.status(502).json({
+        success: false,
+        message: "No se pudo obtener el token de la organización. Verifique sus credenciales.",
+      });
+    }
+  },
+);
+
+// "Supervisar": cambia la sesión a la organización elegida, igual que si el
+// supervisor hubiera iniciado sesión en ella (nuevo JWT con su orgname/orgId).
+app.post(
+  "/api/supervisor/switch",
+  requireRole("supervisor", "administrator"),
+  async (req, res) => {
+    try {
+      const { orgId } = req.body || {};
+      if (!orgId) {
+        return res.status(400).json({ success: false, message: "orgId requerido." });
+      }
+      const { userFound, doc } = await findAccessibleOrg(req, orgId);
+      if (!userFound || !doc) {
+        return res.status(403).json({
+          success: false,
+          message: "No tienes acceso a esta organización.",
+        });
+      }
+      const org = doc.data();
+      if (!org.clientId || !org.clientSecret) {
+        return res.status(422).json({
+          success: false,
+          code: "NO_CREDENTIALS",
+          message: `La organización "${org.orgname}" no tiene credenciales configuradas.`,
+        });
+      }
+      const orgToken = await getTokenForRegion(org.clientId, org.clientSecret, org.region);
+
+      const userResponse = sanitizeUser(userFound);
+      userResponse.orgname = org.orgname;
+      userResponse.orgId = org.orgId || doc.id;
+      userResponse.region = org.region || userFound.region;
+      userResponse.orgToken = orgToken;
+      userResponse.aiEnabled = org.aiEnabled !== false;
+      userResponse.whatsappEnabled = isOrgWhatsappEnabled(org);
+
+      const sessionToken = signSession({
+        username: req.auth.sub,
+        role: userFound.role,
+        orgname: userResponse.orgname,
+        orgId: userResponse.orgId,
+      });
+
+      logEvent({
+        type: EVENT.ORG_SUPERVISE,
+        req,
+        orgname: userResponse.orgname,
+        orgId: userResponse.orgId,
+        role: userFound.role,
+        success: true,
+        message: `Entró a supervisar "${userResponse.orgname}".`,
+        detail: { desde: req.auth?.orgname || null },
+      });
+
+      return res.status(200).json({ success: true, user: userResponse, sessionToken });
+    } catch (error) {
+      console.error("❌ Error en POST /api/supervisor/switch:", error);
+      return res.status(500).json({ success: false, message: error.message });
+    }
+  },
+);
+
 app.post("/api/token", requireAdmin, async (req, res) => {
   try {
     const { clientId, clientSecret, region } = req.body;
@@ -707,6 +899,13 @@ const {
   resolveDailyLimit,
 } = require("./utils/whaibot");
 const { whatsappText } = require("./utils/whatsappMessages");
+const {
+  collectNotifications,
+  markNotifications,
+  listAnnouncements,
+  saveAnnouncement,
+  deleteAnnouncement,
+} = require("./utils/inAppNotifications");
 const { sanitizeQuietHours } = require("./utils/quietHours");
 const {
   getPlatformAlertSettings,
@@ -1179,9 +1378,14 @@ async function genesysAccessForSession(req) {
     if (!snapshot.empty) orgDoc = snapshot.docs[0];
   }
 
+  return genesysAccessForOrgDoc(orgDoc);
+}
+
+/** Token (cacheado) y región de Genesys de un documento de `organizations`. */
+async function genesysAccessForOrgDoc(orgDoc) {
   const org = orgDoc?.data();
   if (!org || !org.clientId || !org.clientSecret) {
-    const error = new Error("La organización de la sesión no tiene credenciales de Genesys configuradas.");
+    const error = new Error("La organización no tiene credenciales de Genesys configuradas.");
     error.status = 404;
     error.expose = true;
     throw error;
@@ -4149,6 +4353,100 @@ app.post("/api/whatsapp/number/remove", async (req, res) => {
   }
 });
 
+// ==================== Notificaciones en la interfaz ====================
+// Campana del dashboard: reglas del sistema + avisos del administrador.
+// Ver utils/inAppNotifications.js.
+
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const userDoc = await sessionUserDoc(req);
+    if (!userDoc) return res.status(200).json({ success: true, notifications: [], unread: 0 });
+    const orgDoc = await findOrgDoc(req.auth?.orgId);
+    const notifications = await collectNotifications({
+      username: userDoc.id,
+      role: req.auth?.role,
+      user: userDoc.data(),
+      org: orgDoc ? orgDoc.data() : null,
+      orgId: orgDoc ? orgDoc.data().orgId || orgDoc.id : req.auth?.orgId || null,
+    });
+    return res.status(200).json({
+      success: true,
+      notifications,
+      unread: notifications.filter((n) => !n.read).length,
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /api/notifications:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor", detail: error.message });
+  }
+});
+
+// { ids: [...] } → leídas.
+app.post("/api/notifications/read", async (req, res) => {
+  try {
+    const count = await markNotifications(req.auth?.sub, req.body?.ids, "read");
+    return res.status(200).json({ success: true, count });
+  } catch (error) {
+    console.error("❌ Error en POST /api/notifications/read:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// { id } → descartada: no vuelve a mostrarse.
+app.post("/api/notifications/dismiss", async (req, res) => {
+  try {
+    const count = await markNotifications(req.auth?.sub, req.body?.id, "dismissed");
+    return res.status(200).json({ success: true, count });
+  } catch (error) {
+    console.error("❌ Error en POST /api/notifications/dismiss:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Avisos del administrador (Configuración > Avisos).
+app.get("/api/announcements", requireAdmin, async (req, res) => {
+  try {
+    return res.status(200).json({ success: true, announcements: await listAnnouncements() });
+  } catch (error) {
+    console.error("❌ Error en GET /api/announcements:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
+// Crear ({ ...aviso }) o actualizar ({ id, ...aviso }).
+app.post("/api/announcements", requireAdmin, async (req, res) => {
+  try {
+    const { id, ...input } = req.body || {};
+    const announcement = await saveAnnouncement(id, input, req.auth?.sub);
+    logEvent({
+      type: EVENT.ANNOUNCEMENT_SAVED,
+      req,
+      target: announcement.id,
+      message: `Aviso "${announcement.title.es || announcement.title.en || announcement.title.pt}" ${id ? "actualizado" : "creado"}.`,
+      detail: { roles: announcement.roles, organizaciones: announcement.orgIds, activo: announcement.active },
+    });
+    return res.status(200).json({ success: true, announcement });
+  } catch (error) {
+    // Los errores de validación llegan con mensaje legible.
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+app.delete("/api/announcements/:id", requireAdmin, async (req, res) => {
+  try {
+    await deleteAnnouncement(req.params.id);
+    logEvent({
+      type: EVENT.ANNOUNCEMENT_DELETED,
+      req,
+      target: req.params.id,
+      message: "Aviso eliminado.",
+    });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("❌ Error en DELETE /api/announcements:", error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  }
+});
+
 // ==================== Alertas de la plataforma ====================
 // Contacto que recibe los errores de License Manager (correo y, si falla,
 // WhatsApp). Ver utils/platformAlerts.js.
@@ -4616,6 +4914,77 @@ app.get("/api/reports/ivr-divisions", async (req, res) => {
     });
   }
 });
+
+// ==================== Tiempo real ====================
+// Vista "Tiempo real" del dashboard. Usa la organización de la sesión (JWT) y
+// sus credenciales OAuth, no un token de Genesys enviado por el navegador. Cada
+// panel tiene su endpoint; la lógica vive en services/genesysRealtime.js.
+function realtimeHandler(loader) {
+  return async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const { token, region } = await genesysAccessForSession(req);
+      const cacheKey = `${req.auth?.orgId || req.auth?.orgname}:${region}`;
+      const data = await loader({ token, region, cacheKey, query: req.query });
+      return res.status(200).json({ success: true, ...data });
+    } catch (error) {
+      const status = Number(error.status) || 500;
+      if (status >= 500) console.error(`❌ [realtime] ${req.path}:`, error);
+      return res.status(status).json({
+        success: false,
+        error: error.expose ? error.message : "Error interno del servidor",
+      });
+    }
+  };
+}
+
+app.get("/api/realtime/trunks", realtimeHandler(getTrunksRealtime));
+app.get("/api/realtime/certificates", realtimeHandler(getCertificatesRealtime));
+
+// ==================== Data Actions ====================
+// Rendimiento de las Data Actions de la org de la sesión para un día
+// (?date=YYYY-MM-DD&timezone=America/Bogota). Ver services/genesysDataActions.js.
+app.get(
+  "/api/data-actions/performance",
+  realtimeHandler(({ token, region, cacheKey, query }) =>
+    getDataActionsPerformance({
+      token,
+      region,
+      cacheKey,
+      date: query.date ? String(query.date) : undefined,
+      timezone: query.timezone ? String(query.timezone) : undefined,
+    }),
+  ),
+);
+
+// Resumen de troncales de UNA org para las tarjetas de /supervisor y /admin.
+app.get(
+  "/api/supervisor/org-trunks",
+  requireRole("supervisor", "administrator"),
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const orgId = String(req.query.orgId || "");
+      if (!orgId) {
+        return res.status(400).json({ success: false, error: "orgId requerido." });
+      }
+      const { doc } = await findAccessibleOrg(req, orgId);
+      if (!doc) {
+        return res.status(403).json({ success: false, error: "No tienes acceso a esta organización." });
+      }
+      const { token, region } = await genesysAccessForOrgDoc(doc);
+      const data = await getTrunksRealtime({ token, region, cacheKey: `${doc.id}:${region}` });
+      return res.status(200).json({ success: true, totals: data.totals, eventTime: data.eventTime });
+    } catch (error) {
+      const status = Number(error.status) || 500;
+      if (status >= 500) console.error("❌ [supervisor] org-trunks:", error);
+      return res.status(status).json({
+        success: false,
+        error: error.expose ? error.message : "Error interno del servidor",
+      });
+    }
+  },
+);
 
 // Endpoint de prueba para guardar algo en Firestore
 app.post("/api/firestore-test", requireAdmin, async (req, res) => {
