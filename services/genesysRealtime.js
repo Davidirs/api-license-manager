@@ -128,7 +128,10 @@ async function loadTrunkConfig(region, token, cacheKey) {
 
 async function loadTrunkMetrics(region, token, cacheKey, trunkIds) {
   if (trunkIds.length === 0) return [];
-  return cached(`${cacheKey}:trunk-metrics`, 4_000, async () => {
+  // La configuración puede cambiar mientras el proceso sigue vivo. Incluye los
+  // IDs en la clave para no reutilizar métricas de una lista anterior.
+  const metricsKey = `${cacheKey}:trunk-metrics:${[...trunkIds].sort().join(",")}`;
+  return cached(metricsKey, 4_000, async () => {
     const chunks = [];
     for (let i = 0; i < trunkIds.length; i += 50) chunks.push(trunkIds.slice(i, i + 50));
     const results = await Promise.all(
@@ -136,7 +139,9 @@ async function loadTrunkMetrics(region, token, cacheKey, trunkIds) {
         genesysGet(region, token, `${EDGES}/trunks/metrics?trunkIds=${encodeURIComponent(ids.join(","))}`),
       ),
     );
-    return results.flatMap((r) => (Array.isArray(r) ? r : r?.entities || []));
+    return results.flatMap((r) =>
+      Array.isArray(r) ? r : Array.isArray(r?.entities) ? r.entities : r ? [r] : [],
+    );
   });
 }
 
@@ -153,10 +158,16 @@ async function getTrunksRealtime({ token, region, cacheKey }) {
     trunks.map((t) => t.id),
   );
 
+  // Genesys publica las métricas de troncal sólo cuando cambian: su eventTime
+  // es la última vez que reportó algo. Si el más reciente es viejo, las cifras
+  // pueden estar congeladas (visto en orgs BYOC Cloud que se quedan en 0).
+  let latestMetricMs = null;
   const metricsByTrunk = new Map();
   metrics.forEach((m) => {
-    const id = m.trunk?.id;
+    const id = m.trunk?.id || m.trunkId || m.id;
     if (id) metricsByTrunk.set(id, m);
+    const t = Date.parse(m.eventTime);
+    if (!Number.isNaN(t) && (latestMetricMs === null || t > latestMetricMs)) latestMetricMs = t;
   });
 
   const groups = new Map();
@@ -237,7 +248,12 @@ async function getTrunksRealtime({ token, region, cacheKey }) {
   );
   totals.total = totals.inbound + totals.outbound;
 
-  return { trunks: list, totals, eventTime: new Date().toISOString() };
+  return {
+    trunks: list,
+    totals,
+    eventTime: new Date().toISOString(),
+    metricsEventTime: latestMetricMs === null ? null : new Date(latestMetricMs).toISOString(),
+  };
 }
 
 // ── Certificados ─────────────────────────────────────────────────────────────

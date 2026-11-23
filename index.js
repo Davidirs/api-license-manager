@@ -4974,7 +4974,12 @@ app.get(
       }
       const { token, region } = await genesysAccessForOrgDoc(doc);
       const data = await getTrunksRealtime({ token, region, cacheKey: `${doc.id}:${region}` });
-      return res.status(200).json({ success: true, totals: data.totals, eventTime: data.eventTime });
+      return res.status(200).json({
+        success: true,
+        totals: data.totals,
+        eventTime: data.eventTime,
+        metricsEventTime: data.metricsEventTime,
+      });
     } catch (error) {
       const status = Number(error.status) || 500;
       if (status >= 500) console.error("❌ [supervisor] org-trunks:", error);
